@@ -2,7 +2,7 @@ import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js
 import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
 
-describe('Tab Recycling', () => {
+describe('Tab capacity admission', () => {
   let serverUrl;
   let testSiteUrl;
 
@@ -18,7 +18,7 @@ describe('Tab Recycling', () => {
     await stopServer();
   }, 30000);
 
-  test('POST /tabs recycles oldest tab when per-session limit reached', async () => {
+  test('POST /tabs rejects at the per-session limit without recycling an existing tab', async () => {
     const client = createClient(serverUrl);
     try {
       const tabs = [];
@@ -28,53 +28,38 @@ describe('Tab Recycling', () => {
         tabs.push(result.tabId);
       }
 
-      // 6th tab should succeed via recycling
-      const result = await client.createTab(`${testSiteUrl}/pageB`);
-      expect(result.tabId).toBeDefined();
-      expect(result.url).toContain('/pageB');
+      await expect(client.createTab(`${testSiteUrl}/pageB`)).rejects.toMatchObject({
+        status: 429,
+        data: { code: 'tab_admission_user_limit', retryAfter: 2 },
+      });
 
-      // The oldest tab (tabs[0]) should be gone
-      try {
-        await client.getSnapshot(tabs[0]);
-        fail('Oldest tab should have been recycled');
-      } catch (err) {
-        expect(err.status).toBe(410);
-      }
-
-      // The new tab should work
-      const snap = await client.getSnapshot(result.tabId);
-      expect(snap.url).toContain('/pageB');
+      const snap = await client.getSnapshot(tabs[0]);
+      expect(snap.url).toContain('/pageA');
     } finally {
       await client.cleanup();
     }
   }, 120000);
 
-  test('can browse many sites sequentially beyond the tab limit', async () => {
+  test('repeated overflow requests remain bounded and do not evict admitted tabs', async () => {
     const client = createClient(serverUrl);
     try {
-      // Simulate a cron job visiting 12 different URLs (limit is 5)
-      const urls = [];
-      for (let i = 0; i < 12; i++) {
-        urls.push(`${testSiteUrl}/page${i}`);
-      }
-
       const tabs = [];
-      for (const url of urls) {
-        const result = await client.createTab(url);
-        expect(result.tabId).toBeDefined();
+      for (let i = 0; i < 5; i++) {
+        const result = await client.createTab(`${testSiteUrl}/pageA`);
         tabs.push(result.tabId);
       }
 
-      // The last tab should be functional
-      const lastTab = tabs[tabs.length - 1];
-      const snap = await client.getSnapshot(lastTab);
-      expect(snap.url).toContain('/page11');
+      for (let i = 0; i < 7; i++) {
+        await expect(client.createTab(`${testSiteUrl}/pageB`)).rejects.toMatchObject({ status: 429 });
+      }
+      const snap = await client.getSnapshot(tabs[0]);
+      expect(snap.url).toContain('/pageA');
     } finally {
       await client.cleanup();
     }
   }, 120000);
 
-  test('recycled tabs are the least-used ones', async () => {
+  test('overflow does not recycle even the least-used tab', async () => {
     const client = createClient(serverUrl);
     try {
       const tabs = [];
@@ -88,21 +73,10 @@ describe('Tab Recycling', () => {
         await client.getSnapshot(tabs[i]);
       }
 
-      // Create a 6th tab -- should recycle tabs[0] (fewest toolCalls)
-      const result = await client.createTab(`${testSiteUrl}/pageB`);
-      expect(result.tabId).toBeDefined();
+      await expect(client.createTab(`${testSiteUrl}/pageB`)).rejects.toMatchObject({ status: 429 });
 
-      // tabs[0] should be recycled (least used)
-      try {
-        await client.getSnapshot(tabs[0]);
-        fail('Least-used tab should have been recycled');
-      } catch (err) {
-        expect(err.status).toBe(410);
-      }
-
-      // tabs[1] should still exist (it had more toolCalls)
-      const snap = await client.getSnapshot(tabs[1]);
-      expect(snap).toBeDefined();
+      await expect(client.getSnapshot(tabs[0])).resolves.toBeDefined();
+      await expect(client.getSnapshot(tabs[1])).resolves.toBeDefined();
     } finally {
       await client.cleanup();
     }

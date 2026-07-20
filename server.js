@@ -37,6 +37,12 @@ import { createReporter, createTabHealthTracker, collectResourceSnapshot, classi
 import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
+import {
+  TabAdmissionController,
+  TabCapacityReservations,
+  sendTabAdmissionError,
+  withAbortableResource,
+} from './lib/tab-admission.js';
 
 const CONFIG = loadConfig();
 
@@ -85,10 +91,11 @@ const authMiddleware = () => requireAuth(CONFIG);
 
 const {
   requestsTotal, requestDuration, pageLoadDuration, snapshotBytes,
-  activeTabsGauge, tabLockQueueDepth,
+  activeTabsGauge, tabLockQueueDepth, tabAdmissionActiveGauge, tabAdmissionPendingGauge,
   tabLockTimeoutsTotal,
   failuresTotal, browserRestartsTotal, tabsDestroyedTotal,
   sessionsExpiredTotal, tabsReapedTotal, tabsRecycledTotal,
+  tabAdmissionRejectedTotal, tabAdmissionTimeoutsTotal,
 } = await initMetrics({ enabled: CONFIG.prometheusEnabled });
 
 // --- Structured logging ---
@@ -389,6 +396,9 @@ const MAX_TABS_PER_SESSION = CONFIG.maxTabsPerSession;
 const MAX_TABS_GLOBAL = CONFIG.maxTabsGlobal;
 const HANDLER_TIMEOUT_MS = CONFIG.handlerTimeoutMs;
 const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
+const TAB_ADMISSION_MAX_ACTIVE = CONFIG.tabAdmissionMaxActive;
+const TAB_ADMISSION_MAX_ACTIVE_PER_USER = CONFIG.tabAdmissionMaxActivePerUser;
+const TAB_ADMISSION_QUEUE_LIMIT = CONFIG.tabAdmissionQueueLimit;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
 const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
@@ -555,6 +565,42 @@ if (proxyPool) {
 } else {
   log('info', 'no proxy configured');
 }
+
+const tabAdmission = new TabAdmissionController({
+  maxActive: TAB_ADMISSION_MAX_ACTIVE,
+  maxActivePerUser: TAB_ADMISSION_MAX_ACTIVE_PER_USER,
+  maxPending: TAB_ADMISSION_QUEUE_LIMIT,
+  waitTimeoutMs: requestTimeoutMs(),
+  operationTimeoutMs: requestTimeoutMs(),
+  retryAfterSeconds: 2,
+  onStateChange: ({ active, pending }) => {
+    tabAdmissionActiveGauge.set(active);
+    tabAdmissionPendingGauge.set(pending);
+  },
+  onRejected: () => tabAdmissionRejectedTotal.inc(),
+  onTimeout: () => tabAdmissionTimeoutsTotal.inc(),
+});
+
+async function withTabAdmission(userId, operation) {
+  return tabAdmission.run(normalizeUserId(userId), operation);
+}
+
+function getUserTabCount(userKey) {
+  const session = sessions.get(userKey);
+  if (!session) return 0;
+  let total = 0;
+  for (const group of session.tabGroups.values()) total += group.size;
+  return total;
+}
+
+const tabCapacity = new TabCapacityReservations({
+  maxGlobal: MAX_TABS_GLOBAL,
+  maxPerUser: MAX_TABS_PER_SESSION,
+  getGlobalCount: getTotalTabCount,
+  getUserCount: getUserTabCount,
+  retryAfterSeconds: 2,
+  onRejected: () => tabAdmissionRejectedTotal.inc(),
+});
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
 let browserIdleTimer = null;
@@ -2562,11 +2608,16 @@ app.post('/pressure/cleanup', authMiddleware(), async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       429:
- *         description: Tab limit reached.
+ *         description: Tab admission queue or capacity limit reached.
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying.
+ *             schema:
+ *               type: integer
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/Error'
+ *               $ref: '#/components/schemas/TabAdmissionError'
  *       409:
  *         description: Cannot enable tracing on an existing session.
  *         content:
@@ -2599,7 +2650,7 @@ app.post('/tabs', async (req, res) => {
       }
     }
 
-    const result = await withTimeout((async () => {
+    const result = await withTabAdmission(userId, async (signal) => {
       const existing = sessions.get(normalizeUserId(userId));
       if (trace && existing && !existing.tracePath) {
         throw Object.assign(
@@ -2607,67 +2658,66 @@ app.post('/tabs', async (req, res) => {
           { statusCode: 409 },
         );
       }
-      let session = await getSession(userId, { trace: !!trace });
-      
-      let totalTabs = 0;
-      for (const group of session.tabGroups.values()) totalTabs += group.size;
-      
-      // Recycle oldest tab when limits are reached instead of rejecting
-      if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-        const recycled = await recycleOldestTab(session, req.reqId, userId);
-        if (!recycled) {
-          throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
-        }
-      }
-      
-      const group = getTabGroup(session, resolvedSessionKey);
-      
-      const page = await session.context.newPage();
-      const tabId = fly.makeTabId();
-      let tabState = createTabState(page);
-      attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-      group.set(tabId, tabState);
-      attachPopupHandler(page, userId, resolvedSessionKey);
-      refreshActiveTabsGauge();
-      
-      if (url) {
-        const urlErr = validateUrl(url);
-        if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
-        tabState.lastRequestedUrl = url;
+
+      const releaseCapacity = tabCapacity.reserve(normalizeUserId(userId));
+      try {
+        const tabId = fly.makeTabId();
+        const createAttempt = async (session) => {
+          let group;
+          let tabState;
+          return withAbortableResource({
+            create: () => session.context.newPage(),
+            signal,
+            register: async (page) => {
+              group = getTabGroup(session, resolvedSessionKey);
+              tabState = createTabState(page);
+              attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+              group.set(tabId, tabState);
+              attachPopupHandler(page, userId, resolvedSessionKey);
+              refreshActiveTabsGauge();
+            },
+            unregister: async () => {
+              if (group?.get(tabId) === tabState) group.delete(tabId);
+              if (group?.size === 0) session.tabGroups.delete(resolvedSessionKey);
+              refreshActiveTabsGauge();
+            },
+            cleanup: safePageClose,
+            operation: async (page) => {
+              if (url) {
+                const urlErr = validateUrl(url);
+                if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
+                tabState.lastRequestedUrl = url;
+                await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+                tabState.visitedUrls.add(url);
+              }
+              pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
+              log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
+              return { tabId, url: page.url() };
+            },
+          });
+        };
+
+        let session = await getSession(userId, { trace: !!trace });
         try {
-          await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          return await createAttempt(session);
         } catch (navErr) {
-          if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
-            log('warn', 'tab create navigate failed, retrying with fresh proxy', {
-              reqId: req.reqId, tabId, error: navErr.message,
-            });
-            browserRestartsTotal.labels('proxy_retry').inc();
-            const key = normalizeUserId(userId);
-            const oldSession = sessions.get(key);
-            if (oldSession) {
-              await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-            }
-            session = await getSession(userId, { trace: !!trace });
-            const retryGroup = getTabGroup(session, resolvedSessionKey);
-            const retryPage = await session.context.newPage();
-            tabState = createTabState(retryPage);
-            tabState.lastRequestedUrl = url;
-            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-            retryGroup.set(tabId, tabState);
-            attachPopupHandler(retryPage, userId, resolvedSessionKey);
-            refreshActiveTabsGauge();
-            await withPageLoadDuration('open_url', () => retryPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-          } else {
-            throw navErr;
+          if (!(url && (isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions)) throw navErr;
+          log('warn', 'tab create navigate failed, retrying with fresh proxy', {
+            reqId: req.reqId, tabId, error: navErr.message,
+          });
+          browserRestartsTotal.labels('proxy_retry').inc();
+          const key = normalizeUserId(userId);
+          const oldSession = sessions.get(key);
+          if (oldSession) {
+            await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
           }
+          session = await getSession(userId, { trace: !!trace });
+          return createAttempt(session);
         }
-        tabState.visitedUrls.add(url);
+      } finally {
+        releaseCapacity();
       }
-      
-      pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
-      log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-      return { tabId, url: page.url() };
-    })(), requestTimeoutMs(), 'tab create');
+    });
 
     res.json(result);
   } catch (err) {
@@ -2685,7 +2735,9 @@ app.post('/tabs', async (req, res) => {
         recoverable: false,
       });
     }
-    // Memory pressure / max sessions → bounce through LB to another machine
+    // Admission overflow/timeouts are explicitly retryable and machine-readable.
+    if (sendTabAdmissionError(res, err, safeError(err))) return;
+    // Memory pressure / max sessions → bounce through LB to another machine.
     if (FLY_MACHINE_ID && err.statusCode === 503) {
       res.set('fly-replay', `app=${CONFIG.flyAppName || 'camofox-browser'}`);
       return res.status(503).json({ error: safeError(err), code: err.code || 'admission_rejected' });
