@@ -100,6 +100,41 @@ describe('createPageWithSessionRecovery', () => {
     expect(releases[1]).toHaveBeenCalledTimes(1);
   });
 
+  test('keeps the original reservation until a timed-out new-page promise settles late', async () => {
+    const timeoutError = Object.assign(new Error('new page timed out'), { code: 'timeout' });
+    let resolveOldPage;
+    const oldPagePromise = new Promise(resolve => { resolveOldPage = resolve; });
+    const oldSession = { id: 'old', context: { newPage: jest.fn(() => oldPagePromise) } };
+    const page = { id: 'fresh-page' };
+    const replacement = { id: 'replacement', context: { newPage: jest.fn().mockResolvedValue(page) } };
+    const releases = new Map();
+    const reservePendingCreation = jest.fn(session => {
+      const release = jest.fn();
+      releases.set(session.id, release);
+      return release;
+    });
+
+    const result = await createPageWithSessionRecovery(recoveryOptions({
+      session: oldSession,
+      withTimeout: (promise, _timeoutMs, label) => label === 'new page'
+        ? Promise.reject(timeoutError)
+        : promise,
+      currentSession: () => oldSession,
+      destroySession: async () => {},
+      getSession: async () => replacement,
+      reservePendingCreation,
+    }));
+
+    expect(result).toEqual({ session: replacement, page });
+    expect(releases.get('old')).not.toHaveBeenCalled();
+    expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
+
+    resolveOldPage({ id: 'late-page' });
+    await oldPagePromise;
+    await new Promise(resolve => setImmediate(resolve));
+    expect(releases.get('old')).toHaveBeenCalledTimes(1);
+  });
+
   test('does not recover unrelated failures', async () => {
     const error = new Error('programming error');
     const session = { context: { newPage: jest.fn().mockRejectedValue(error) } };
