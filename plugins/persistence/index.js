@@ -108,6 +108,8 @@ export async function register(app, ctx, pluginConfig = {}) {
   // Before session context is created: inject storageState if we have one saved
   events.on('session:creating', async ({ userId, contextOptions }) => {
     if (resettingUsers.has(userId)) return;
+    await checkpointPromises.get(userId)?.catch(() => {});
+    if (resettingUsers.has(userId)) return;
     const storageStatePath = await loadPersistedStorageState(profileDir, userId, logger);
     if (storageStatePath) {
       contextOptions.storageState = storageStatePath;

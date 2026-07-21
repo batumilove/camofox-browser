@@ -37,7 +37,10 @@ describe('createPageWithSessionRecovery', () => {
       getSession,
     }));
 
-    expect(destroySession).toHaveBeenCalledWith('user-1', { reason: 'new_page_unresponsive' });
+    expect(destroySession).toHaveBeenCalledWith('user-1', {
+      reason: 'new_page_unresponsive',
+      expectedSession: oldSession,
+    });
     expect(getSession).toHaveBeenCalledWith('user-1', { trace: false });
     expect(result).toMatchObject({ session: replacement, page });
     expect(result.lease).toMatchObject({ page, released: false });
@@ -113,10 +116,16 @@ describe('createPageWithSessionRecovery', () => {
     const latePage = { id: 'late-page' };
     const replacement = { id: 'replacement', context: { newPage: jest.fn().mockResolvedValue(page) } };
     const releases = new Map();
+    const rawReleases = new Map();
     const reservePendingCreation = jest.fn(session => {
       const release = jest.fn();
       releases.set(session.id, release);
       return release;
+    });
+    const reserveRawCreation = jest.fn(session => {
+      const lease = { settle: jest.fn() };
+      rawReleases.set(session.id, lease.settle);
+      return lease;
     });
     const cleanupLatePage = jest.fn(() => cleanupGate);
 
@@ -129,23 +138,28 @@ describe('createPageWithSessionRecovery', () => {
       destroySession: async () => {},
       getSession: async () => replacement,
       reservePendingCreation,
+      reserveRawCreation,
       cleanupLatePage,
     }));
 
     expect(result).toEqual({ session: replacement, page });
     expect(releases.get('old')).not.toHaveBeenCalled();
     expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
+    expect(rawReleases.get('old')).not.toHaveBeenCalled();
+    expect(rawReleases.get('replacement')).toHaveBeenCalledTimes(1);
 
     resolveOldPage(latePage);
     await oldPagePromise;
     await new Promise(resolve => setImmediate(resolve));
     expect(cleanupLatePage).toHaveBeenCalledWith(latePage);
     expect(releases.get('old')).not.toHaveBeenCalled();
+    expect(rawReleases.get('old')).not.toHaveBeenCalled();
 
     finishCleanup();
     await cleanupGate;
     await new Promise(resolve => setImmediate(resolve));
     expect(releases.get('old')).toHaveBeenCalledTimes(1);
+    expect(rawReleases.get('old')).toHaveBeenCalledTimes(1);
   });
 
   test('closes a retry page that resolves after the retry timed out', async () => {

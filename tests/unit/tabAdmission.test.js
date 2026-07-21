@@ -1,14 +1,18 @@
 import { jest } from '@jest/globals';
 import {
+  OrphanPageCleanup,
+  RawCreationRegistry,
   TabAdmissionController,
   TabCapacityReservations,
   abortPendingTabCreations,
   awaitAbortableResource,
   canReapEmptySession,
+  closeContextWithin,
   closePageWithin,
   deleteSessionMappingIfCurrent,
   hasPendingTabCreations,
   reservePendingTabCreation,
+  scheduleSiblingSessionCleanup,
   sendTabAdmissionError,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
@@ -211,6 +215,40 @@ describe('TabAdmissionController', () => {
   });
 });
 
+describe('RawCreationRegistry', () => {
+  test('bounds unresolved raw work globally and per user until explicit settlement', () => {
+    const registry = new RawCreationRegistry({ maxOutstanding: 2, maxPerUser: 1, retryAfterSeconds: 2 });
+    const first = registry.acquire({ userKey: 'u1', kind: 'page', deadlineMs: 1000 });
+    expect(registry.snapshot()).toMatchObject({ outstanding: 1, byKind: { page: 1 } });
+    expect(() => registry.acquire({ userKey: 'u1', kind: 'page', deadlineMs: 1000 }))
+      .toThrow(expect.objectContaining({ code: 'tab_admission_raw_creation_limit', statusCode: 429 }));
+    const second = registry.acquire({ userKey: 'u2', kind: 'context', deadlineMs: 1000 });
+    expect(() => registry.acquire({ userKey: 'u3', kind: 'page', deadlineMs: 1000 }))
+      .toThrow(expect.objectContaining({ code: 'tab_admission_raw_creation_limit' }));
+    first.settle();
+    second.settle();
+    expect(registry.snapshot().outstanding).toBe(0);
+  });
+
+  test('deadline escalates once but retains ownership until settlement', async () => {
+    jest.useFakeTimers();
+    try {
+      const onDeadline = jest.fn(async () => {});
+      const registry = new RawCreationRegistry({ maxOutstanding: 1, maxPerUser: 1, onDeadline });
+      const lease = registry.acquire({ userKey: 'u1', kind: 'page', deadlineMs: 50, owner: { id: 's1' } });
+      await jest.advanceTimersByTimeAsync(50);
+      expect(onDeadline).toHaveBeenCalledTimes(1);
+      expect(registry.snapshot().outstanding).toBe(1);
+      expect(() => registry.acquire({ userKey: 'u2', kind: 'page', deadlineMs: 50 }))
+        .toThrow(expect.objectContaining({ code: 'tab_admission_raw_creation_limit' }));
+      lease.settle();
+      expect(registry.snapshot().outstanding).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
 describe('TabCapacityReservations', () => {
   test('atomically enforces resident global and per-user tab limits', () => {
     let globalTabs = 1;
@@ -311,6 +349,45 @@ describe('TabCapacityReservations', () => {
     reacquired();
   });
 
+  test('admits an already-resident popup only when projected capacity stays within limits', () => {
+    let residentGlobal = 1;
+    let residentUser = 1;
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 2,
+      maxPerUser: 2,
+      getGlobalCount: () => residentGlobal,
+      getUserCount: () => residentUser,
+    });
+
+    expect(() => capacity.adoptResident('u1')).not.toThrow();
+
+    residentGlobal = 3;
+    residentUser = 3;
+    expect(() => capacity.adoptResident('u1')).toThrow(expect.objectContaining({
+      code: 'tab_admission_user_limit',
+      statusCode: 429,
+    }));
+  });
+
+  test('rejects a resident popup when an API creation already owns the remaining slot', () => {
+    let residentGlobal = 1;
+    let residentUser = 1;
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 2,
+      maxPerUser: 2,
+      getGlobalCount: () => residentGlobal,
+      getUserCount: () => residentUser,
+    });
+    const pending = capacity.reserve('u1');
+    residentGlobal = 2;
+    residentUser = 2;
+
+    expect(() => capacity.adoptResident('u1')).toThrow(expect.objectContaining({
+      code: 'tab_admission_user_limit',
+    }));
+    pending();
+  });
+
   test('returns a machine-readable global rejection when no recycle victim exists', () => {
     const capacity = new TabCapacityReservations({
       maxGlobal: 2,
@@ -358,6 +435,20 @@ describe('pending tab creation and empty-session reaping', () => {
     expect(hasPendingTabCreations(session)).toBe(true);
     release();
     expect(hasPendingTabCreations(session)).toBe(false);
+  });
+
+  test('rejects lease acquisition atomically once teardown has begun', () => {
+    const reason = Object.assign(new Error('session is closing'), { code: 'session_evicted' });
+    const session = {
+      tabGroups: new Map(),
+      _closing: true,
+      _closingReason: reason,
+      _pendingTabCreations: 0,
+    };
+
+    expect(() => reservePendingTabCreation(session)).toThrow(reason);
+    expect(session._pendingTabCreations).toBe(0);
+    expect(session._pendingTabCreationLeases).toBeUndefined();
   });
 
   test('emergency teardown aborts and releases every pending creation lease', () => {
@@ -431,6 +522,83 @@ describe('sendTabAdmissionError', () => {
       code: 'tab_admission_rejected',
       retryAfter: 2,
     });
+  });
+});
+
+describe('browser escalation sibling cleanup', () => {
+  test('schedules siblings without awaiting them and skips current or already-closing sessions', async () => {
+    const never = new Promise(() => {});
+    const current = { id: 'current', _closing: true };
+    const sibling = { id: 'sibling' };
+    const closing = { id: 'closing', _closing: true };
+    const cleanup = jest.fn(() => never);
+    const sessions = new Map([
+      ['current', current],
+      ['sibling', sibling],
+      ['closing', closing],
+    ]);
+
+    expect(scheduleSiblingSessionCleanup({ sessions, currentSession: current, cleanup })).toBe(1);
+    await flush();
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(cleanup).toHaveBeenCalledWith('sibling', sibling);
+  });
+});
+
+describe('bounded context cleanup', () => {
+  test('returns false and escalates when context.close never settles', async () => {
+    jest.useFakeTimers();
+    try {
+      const onTimeout = jest.fn();
+      const context = { close: jest.fn(() => new Promise(() => {})) };
+      const result = closeContextWithin(context, { timeoutMs: 50, onTimeout });
+      await jest.advanceTimersByTimeAsync(50);
+      await expect(result).resolves.toBe(false);
+      expect(context.close).toHaveBeenCalledTimes(1);
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('returns true when context closes before the deadline', async () => {
+    const context = { close: jest.fn(async () => {}) };
+    await expect(closeContextWithin(context, { timeoutMs: 50 })).resolves.toBe(true);
+    expect(context.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('bounded orphan cleanup', () => {
+  test('deduplicates cleanup while a page close is already in flight', async () => {
+    const gate = deferred();
+    const closePage = jest.fn(() => gate.promise);
+    const tracker = new OrphanPageCleanup({ closePage, maxAttempts: 2, onEscalate: jest.fn() });
+    const session = {};
+    const page = { isClosed: () => false };
+
+    const first = tracker.cleanup(session, page, 'test');
+    await flush();
+    await expect(tracker.cleanup(session, page, 'duplicate')).resolves.toBe(false);
+    expect(closePage).toHaveBeenCalledTimes(1);
+    gate.resolve();
+    await expect(first).resolves.toBe(false);
+  });
+
+  test('escalates after repeated bounded cleanup failures', async () => {
+    const onEscalate = jest.fn(async () => {});
+    const tracker = new OrphanPageCleanup({
+      closePage: jest.fn(async () => {}),
+      maxAttempts: 2,
+      onEscalate,
+    });
+    const session = { id: 'owner' };
+    const page = { isClosed: () => false };
+
+    await expect(tracker.cleanup(session, page, 'first')).resolves.toBe(false);
+    expect(onEscalate).not.toHaveBeenCalled();
+    await expect(tracker.cleanup(session, page, 'second')).resolves.toBe(false);
+    expect(onEscalate).toHaveBeenCalledTimes(1);
+    expect(onEscalate).toHaveBeenCalledWith(session, page, 'second', 2);
   });
 });
 
@@ -515,6 +683,53 @@ describe('awaitAbortableResource', () => {
     expect(registered.size).toBe(0);
     expect(close).toHaveBeenCalledWith(resource);
     await expect(result).rejects.toThrow('request timed out');
+  });
+
+  test('retains operation ownership for a bounded grace while creation is still detached', async () => {
+    jest.useFakeTimers();
+    try {
+      const abort = new AbortController();
+      const rawCreate = deferred();
+      let settled = false;
+      const result = withAbortableResource({
+        create: async () => rawCreate.promise,
+        signal: abort.signal,
+        register: jest.fn(),
+        unregister: jest.fn(),
+        cleanup: jest.fn(),
+        cleanupTimeoutMs: 50,
+        operation: jest.fn(),
+      });
+      result.catch(() => { settled = true; });
+      await flush();
+
+      abort.abort(new Error('request timed out'));
+      await jest.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await expect(result).rejects.toThrow('request timed out');
+      rawCreate.reject(new Error('terminated later'));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('does not invoke create when the signal is already aborted', async () => {
+    const controller = new AbortController();
+    const reason = Object.assign(new Error('already expired'), { code: 'tab_admission_operation_timeout' });
+    controller.abort(reason);
+    const create = jest.fn(async () => ({ id: 'must-not-exist' }));
+
+    await expect(withAbortableResource({
+      create,
+      signal: controller.signal,
+      register: jest.fn(),
+      unregister: jest.fn(),
+      cleanup: jest.fn(),
+      operation: jest.fn(),
+    })).rejects.toBe(reason);
+    expect(create).not.toHaveBeenCalled();
   });
 
   test('bounds cleanup after abort even when cleanup never settles', async () => {

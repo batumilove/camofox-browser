@@ -28,6 +28,17 @@ async function openLegacyTab(userId, url, listItemId = 'default') {
   return postJson('/tabs/open', { userId, listItemId, url });
 }
 
+async function waitForListedTabs(userId, expected, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${serverUrl}/tabs?userId=${encodeURIComponent(userId)}`);
+    const body = await response.json();
+    if (body.tabs?.length === expected) return body.tabs;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${expected} listed tabs for ${userId}`);
+}
+
 beforeAll(async () => {
   await startTestSite();
   testSiteUrl = getTestSiteUrl();
@@ -90,6 +101,63 @@ describe('tab admission route integration', () => {
       const snapshot = await fetch(`${serverUrl}/tabs/${result.body.tabId}/snapshot?userId=concurrent`);
       expect(snapshot.status).toBe(200);
     }
+  }, 60000);
+
+  test('closes a popup that would exceed resident plus reserved capacity', async () => {
+    const first = await createTab('popup-capacity', `${testSiteUrl}/popup-source`, 'popup-first');
+    const second = await createTab('popup-capacity', `${testSiteUrl}/pageA`, 'popup-second');
+    expect([first.status, second.status]).toEqual([200, 200]);
+
+    const evaluate = await fetch(`${serverUrl}/tabs/${first.body.tabId}/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: 'popup-capacity',
+        expression: "window.open('/popup-target', '_blank')",
+      }),
+    });
+    expect(evaluate.status).toBe(200);
+    await new Promise(resolve => setTimeout(resolve, 750));
+
+    const list = await fetch(`${serverUrl}/tabs?userId=popup-capacity`).then(response => response.json());
+    expect(list.tabs).toHaveLength(2);
+    expect(list.tabs.some(tab => tab.url.includes('/popup-target'))).toBe(false);
+  }, 60000);
+
+  test('DELETE invalidates an in-flight tab generation before it can return or republish', async () => {
+    const userId = 'delete-generation-race';
+    users.add(userId);
+    const pendingCreate = createTab(userId, `${testSiteUrl}/slow?ms=5000`, 'old-generation');
+    await waitForListedTabs(userId, 1);
+
+    const deleted = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+    expect(deleted.status).toBe(200);
+    const staleResult = await pendingCreate;
+    expect(staleResult.status).not.toBe(200);
+
+    const replacement = await createTab(userId, `${testSiteUrl}/pageA`, 'new-generation');
+    expect(replacement.status).toBe(200);
+    const tabs = await waitForListedTabs(userId, 1);
+    expect(tabs[0].tabId).toBe(replacement.body.tabId);
+    expect(tabs[0].listItemId).toBe('new-generation');
+  }, 60000);
+
+  test('legacy DELETE race cannot return or republish an old generation', async () => {
+    const userId = 'legacy-delete-generation-race';
+    users.add(userId);
+    const pendingOpen = openLegacyTab(userId, `${testSiteUrl}/slow?ms=5000`, 'legacy-old');
+    await waitForListedTabs(userId, 1);
+
+    const deleted = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+    expect(deleted.status).toBe(200);
+    const staleResult = await pendingOpen;
+    expect(staleResult.status).not.toBe(200);
+
+    const replacement = await openLegacyTab(userId, `${testSiteUrl}/pageB`, 'legacy-new');
+    expect(replacement.status).toBe(200);
+    const tabs = await waitForListedTabs(userId, 1);
+    expect(tabs[0].tabId).toBe(replacement.body.tabId);
+    expect(tabs[0].listItemId).toBe('legacy-new');
   }, 60000);
 
   test('legacy tab-open route shares the bounded queue and machine-readable overflow contract', async () => {

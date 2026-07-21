@@ -151,6 +151,41 @@ describe('persistence plugin', () => {
     expect(replacementContext.storageState).toHaveBeenCalledTimes(2);
   });
 
+  test('replacement creation waits for the prior destroying checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let finishOldCheckpoint;
+    let markOldCheckpointStarted;
+    const oldCheckpointGate = new Promise(resolve => { finishOldCheckpoint = resolve; });
+    const oldCheckpointStarted = new Promise(resolve => { markOldCheckpointStarted = resolve; });
+    const oldContext = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        markOldCheckpointStarted();
+        await oldCheckpointGate;
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [{ name: 'fresh', value: '1', domain: '.x', path: '/' }], origins: [] }));
+      }),
+    };
+    await events.emitAsync('session:created', { userId: 'barrier-user', context: oldContext });
+    const destroying = events.emitAsync('session:destroying', {
+      userId: 'barrier-user',
+      reason: 'replacement',
+      context: oldContext,
+    });
+    await oldCheckpointStarted;
+
+    const contextOptions = {};
+    let creatingSettled = false;
+    const creating = events.emitAsync('session:creating', { userId: 'barrier-user', contextOptions })
+      .finally(() => { creatingSettled = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(creatingSettled).toBe(false);
+    expect(contextOptions.storageState).toBeUndefined();
+
+    finishOldCheckpoint();
+    await Promise.all([destroying, creating]);
+    expect(contextOptions.storageState).toEqual(expect.stringContaining('storage-state.json'));
+  });
+
   test('DELETE storage_state destroys the live session without checkpointing and removes persisted state', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
 
@@ -221,6 +256,43 @@ describe('persistence plugin', () => {
     const { getUserPersistencePaths } = await import('../../lib/persistence.js');
     const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-race');
     await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('storage reset blocks persistence restore while session invalidation is unresolved', async () => {
+    let finishDestroy;
+    let markDestroyStarted;
+    const destroyStarted = new Promise(resolve => { markDestroyStarted = resolve; });
+    const destroyBlocked = new Promise(resolve => { finishDestroy = resolve; });
+    ctx.destroySession.mockImplementationOnce(async () => {
+      markDestroyStarted();
+      await destroyBlocked;
+      return true;
+    });
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const call = mockApp.delete.mock.calls.find(c => c[0] === '/sessions/:userId/storage_state');
+    const handler = call.at(-1);
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { userDir, storageStatePath } = getUserPersistencePaths(tmpDir, 'user-reset-create-race');
+    await fs.mkdir(userDir, { recursive: true });
+    await fs.writeFile(storageStatePath, JSON.stringify({ cookies: [], origins: [] }));
+
+    const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
+    const reset = handler({ params: { userId: 'user-reset-create-race' } }, res);
+    await destroyStarted;
+
+    const contextOptions = {};
+    await events.emitAsync('session:creating', {
+      userId: 'user-reset-create-race',
+      contextOptions,
+    });
+    expect(contextOptions.storageState).toBeUndefined();
+    expect(res.json).not.toHaveBeenCalled();
+
+    finishDestroy();
+    await reset;
+    await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ ok: true, clearedLive: true }));
   });
 
   test('DELETE storage_state is idempotent without a live session or persisted file', async () => {
