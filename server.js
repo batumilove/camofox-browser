@@ -52,6 +52,8 @@ import {
 import {
   TabAdmissionController,
   TabCapacityReservations,
+  canReapEmptySession,
+  reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
 } from './lib/tab-admission.js';
@@ -1426,7 +1428,15 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
 
-      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
+      const created = {
+        context,
+        tabGroups: new Map(),
+        pageLeases: new Set(),
+        lastAccess: Date.now(),
+        proxySessionId: sessionProxy?.sessionId || null,
+        tracePath,
+        _pendingTabCreations: 0,
+      };
       sessions.set(key, created);
       await pluginEvents.emitAsync('session:created', { userId: key, context });
       log('info', 'session created', {
@@ -2927,12 +2937,14 @@ app.post('/tabs', async (req, res) => {
           let effectiveSession = initialSession;
           let group;
           let tabState;
-          return withAbortableResource({
-            create: async () => {
-              const created = await createPageWithRecoveryForUser(userId, effectiveSession, { trace: !!trace });
-              effectiveSession = created.session;
-              return { page: created.page, lease: created.lease };
-            },
+          const releasePendingCreation = reservePendingTabCreation(effectiveSession);
+          try {
+            return await withAbortableResource({
+              create: async () => {
+                const created = await createPageWithRecoveryForUser(userId, effectiveSession, { trace: !!trace });
+                effectiveSession = created.session;
+                return { page: created.page, lease: created.lease };
+              },
             signal,
             register: async (resource) => {
               group = getTabGroup(effectiveSession, resolvedSessionKey);
@@ -2970,7 +2982,10 @@ app.post('/tabs', async (req, res) => {
               log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
               return { tabId, url: page.url() };
             },
-          });
+            });
+          } finally {
+            releasePendingCreation();
+          }
         };
 
         try {
@@ -5680,8 +5695,10 @@ setInterval(() => {
         session.tabGroups.delete(listItemId);
       }
     }
-    // Clean up sessions with zero tabs remaining -- free browser context memory
-    if (session.tabGroups.size === 0 && !hasActivePageLeases(session)) {
+    // Clean up sessions with zero tabs remaining -- free browser context memory.
+    // A session may be temporarily empty while newPage() is still resolving;
+    // both page leases and legacy pending reservations block reaping.
+    if (canReapEmptySession(session) && !hasActivePageLeases(session)) {
       session._closing = true;
       log('info', 'session empty after tab reaper, closing', { userId });
       closeSession(userId, session, { reason: 'tab_reaper_empty_session', clearDownloads: true, clearLocks: true }).catch(() => {});
