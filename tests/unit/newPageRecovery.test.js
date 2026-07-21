@@ -1,5 +1,6 @@
 import { describe, expect, jest, test } from '@jest/globals';
 import { createPageWithSessionRecovery } from '../../lib/new-page-recovery.js';
+import { abortPendingTabCreations, reservePendingTabCreation } from '../../lib/tab-admission.js';
 
 const isTimeoutError = err => err.code === 'timeout';
 const isDeadContextError = err => err.code === 'dead_context';
@@ -101,12 +102,15 @@ describe('createPageWithSessionRecovery', () => {
     expect(releases[1]).toHaveBeenCalledTimes(1);
   });
 
-  test('keeps the original reservation until a timed-out new-page promise settles late', async () => {
+  test('keeps the original reservation until a timed-out late page is closed', async () => {
     const timeoutError = Object.assign(new Error('new page timed out'), { code: 'timeout' });
     let resolveOldPage;
+    let finishCleanup;
     const oldPagePromise = new Promise(resolve => { resolveOldPage = resolve; });
+    const cleanupGate = new Promise(resolve => { finishCleanup = resolve; });
     const oldSession = { id: 'old', context: { newPage: jest.fn(() => oldPagePromise) } };
     const page = { id: 'fresh-page' };
+    const latePage = { id: 'late-page' };
     const replacement = { id: 'replacement', context: { newPage: jest.fn().mockResolvedValue(page) } };
     const releases = new Map();
     const reservePendingCreation = jest.fn(session => {
@@ -114,6 +118,7 @@ describe('createPageWithSessionRecovery', () => {
       releases.set(session.id, release);
       return release;
     });
+    const cleanupLatePage = jest.fn(() => cleanupGate);
 
     const result = await createPageWithSessionRecovery(recoveryOptions({
       session: oldSession,
@@ -124,16 +129,151 @@ describe('createPageWithSessionRecovery', () => {
       destroySession: async () => {},
       getSession: async () => replacement,
       reservePendingCreation,
+      cleanupLatePage,
     }));
 
     expect(result).toEqual({ session: replacement, page });
     expect(releases.get('old')).not.toHaveBeenCalled();
     expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
 
-    resolveOldPage({ id: 'late-page' });
+    resolveOldPage(latePage);
     await oldPagePromise;
     await new Promise(resolve => setImmediate(resolve));
+    expect(cleanupLatePage).toHaveBeenCalledWith(latePage);
+    expect(releases.get('old')).not.toHaveBeenCalled();
+
+    finishCleanup();
+    await cleanupGate;
+    await new Promise(resolve => setImmediate(resolve));
     expect(releases.get('old')).toHaveBeenCalledTimes(1);
+  });
+
+  test('closes a retry page that resolves after the retry timed out', async () => {
+    const timeoutError = Object.assign(new Error('new page timed out'), { code: 'timeout' });
+    let resolveRetryPage;
+    const retryPromise = new Promise(resolve => { resolveRetryPage = resolve; });
+    const oldSession = { id: 'old', context: { newPage: jest.fn().mockRejectedValue(timeoutError) } };
+    const replacement = { id: 'replacement', context: { newPage: jest.fn(() => retryPromise) } };
+    const latePage = { id: 'late-retry-page' };
+    const cleanupLatePage = jest.fn(async () => {});
+    const releases = new Map();
+    const reservePendingCreation = jest.fn(session => {
+      const release = jest.fn();
+      releases.set(session.id, release);
+      return release;
+    });
+
+    await expect(createPageWithSessionRecovery(recoveryOptions({
+      session: oldSession,
+      withTimeout: (promise, _timeoutMs, label) => label === 'new page retry'
+        ? Promise.reject(timeoutError)
+        : promise,
+      currentSession: () => oldSession,
+      destroySession: async () => {},
+      getSession: async () => replacement,
+      reservePendingCreation,
+      cleanupLatePage,
+    }))).rejects.toBe(timeoutError);
+
+    expect(releases.get('replacement')).not.toHaveBeenCalled();
+    resolveRetryPage(latePage);
+    await retryPromise;
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cleanupLatePage).toHaveBeenCalledWith(latePage);
+    expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
+  });
+
+  test('releases without cleanup when an abandoned raw attempt rejects late', async () => {
+    const timeoutError = Object.assign(new Error('new page timed out'), { code: 'timeout' });
+    let rejectOldPage;
+    const oldPagePromise = new Promise((_, reject) => { rejectOldPage = reject; });
+    const oldSession = { id: 'old', context: { newPage: jest.fn(() => oldPagePromise) } };
+    const replacementPage = { id: 'replacement-page' };
+    const replacement = { id: 'replacement', context: { newPage: jest.fn().mockResolvedValue(replacementPage) } };
+    const cleanupLatePage = jest.fn(async () => {});
+    const releases = new Map();
+    const reservePendingCreation = jest.fn(activeSession => {
+      const release = jest.fn();
+      releases.set(activeSession.id, release);
+      return release;
+    });
+
+    await expect(createPageWithSessionRecovery(recoveryOptions({
+      session: oldSession,
+      withTimeout: (promise, _timeoutMs, label) => label === 'new page'
+        ? Promise.reject(timeoutError)
+        : promise,
+      currentSession: () => oldSession,
+      destroySession: async () => {},
+      getSession: async () => replacement,
+      reservePendingCreation,
+      cleanupLatePage,
+    }))).resolves.toEqual({ session: replacement, page: replacementPage });
+
+    expect(releases.get('old')).not.toHaveBeenCalled();
+    rejectOldPage(new Error('late context close'));
+    await oldPagePromise.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cleanupLatePage).not.toHaveBeenCalled();
+    expect(releases.get('old')).toHaveBeenCalledTimes(1);
+  });
+
+  test('cleans rather than adopts when resolve and emergency abort occur in one turn', async () => {
+    let resolvePage;
+    const rawPage = new Promise(resolve => { resolvePage = resolve; });
+    const session = { tabGroups: new Map(), context: { newPage: jest.fn(() => rawPage) } };
+    const cleanupLatePage = jest.fn(async () => {});
+    const reason = Object.assign(new Error('session evicted'), { code: 'session_evicted' });
+    const result = createPageWithSessionRecovery(recoveryOptions({
+      session,
+      currentSession: () => session,
+      destroySession: jest.fn(),
+      getSession: jest.fn(),
+      reservePendingCreation: reservePendingTabCreation,
+      cleanupLatePage,
+    }));
+    await Promise.resolve();
+
+    const page = { id: 'adjacent-race-page' };
+    resolvePage(page);
+    abortPendingTabCreations(session, reason);
+    await expect(result).rejects.toBe(reason);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cleanupLatePage).toHaveBeenCalledTimes(1);
+    expect(cleanupLatePage).toHaveBeenCalledWith(page);
+  });
+
+  test('emergency session teardown aborts recovery and still closes a late page', async () => {
+    let resolvePage;
+    const rawPage = new Promise(resolve => { resolvePage = resolve; });
+    const session = {
+      tabGroups: new Map(),
+      context: { newPage: jest.fn(() => rawPage) },
+    };
+    const reason = Object.assign(new Error('session evicted'), { code: 'session_evicted' });
+    const cleanupLatePage = jest.fn(async () => {});
+    const destroySession = jest.fn();
+    const getSession = jest.fn();
+    const result = createPageWithSessionRecovery(recoveryOptions({
+      session,
+      currentSession: () => session,
+      destroySession,
+      getSession,
+      reservePendingCreation: reservePendingTabCreation,
+      cleanupLatePage,
+    }));
+
+    await Promise.resolve();
+    expect(abortPendingTabCreations(session, reason)).toBe(1);
+    await expect(result).rejects.toBe(reason);
+    expect(destroySession).not.toHaveBeenCalled();
+    expect(getSession).not.toHaveBeenCalled();
+
+    const latePage = { id: 'late-after-eviction' };
+    resolvePage(latePage);
+    await rawPage;
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cleanupLatePage).toHaveBeenCalledWith(latePage);
   });
 
   test('does not recover unrelated failures', async () => {

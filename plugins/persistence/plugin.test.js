@@ -109,6 +109,48 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('does not let old destroying/destroyed events remove a replacement context', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let finishOldCheckpoint;
+    let markOldCheckpointStarted;
+    const oldCheckpointGate = new Promise(resolve => { finishOldCheckpoint = resolve; });
+    const oldCheckpointStarted = new Promise(resolve => { markOldCheckpointStarted = resolve; });
+    const oldContext = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        markOldCheckpointStarted();
+        await oldCheckpointGate;
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+    const replacementContext = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'replacement-race', context: oldContext });
+    const destroying = events.emitAsync('session:destroying', {
+      userId: 'replacement-race',
+      reason: 'new_page_unresponsive',
+      context: oldContext,
+    });
+    await oldCheckpointStarted;
+    await events.emitAsync('session:created', { userId: 'replacement-race', context: replacementContext });
+    finishOldCheckpoint();
+    await destroying;
+
+    await events.emitAsync('session:cookies:import', { userId: 'replacement-race' });
+    expect(replacementContext.storageState).toHaveBeenCalledTimes(1);
+
+    await events.emitAsync('session:destroyed', {
+      userId: 'replacement-race',
+      reason: 'new_page_unresponsive',
+      context: oldContext,
+    });
+    await events.emitAsync('session:cookies:import', { userId: 'replacement-race' });
+    expect(replacementContext.storageState).toHaveBeenCalledTimes(2);
+  });
+
   test('DELETE storage_state destroys the live session without checkpointing and removes persisted state', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
 

@@ -2,8 +2,12 @@ import { jest } from '@jest/globals';
 import {
   TabAdmissionController,
   TabCapacityReservations,
+  abortPendingTabCreations,
   awaitAbortableResource,
   canReapEmptySession,
+  closePageWithin,
+  deleteSessionMappingIfCurrent,
+  hasPendingTabCreations,
   reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
@@ -147,6 +151,36 @@ describe('TabAdmissionController', () => {
     }
   });
 
+  test('releases an admission slot after abort grace even if work never acknowledges abort', async () => {
+    jest.useFakeTimers();
+    const stuck = deferred();
+    try {
+      const controller = new TabAdmissionController({
+        maxActive: 1,
+        maxActivePerUser: 1,
+        maxPending: 1,
+        operationTimeoutMs: 100,
+        abortGraceMs: 50,
+      });
+      const first = controller.run('u1', () => stuck.promise);
+      const firstRejection = expect(first).rejects.toMatchObject({ code: 'tab_admission_operation_timeout' });
+      const second = controller.run('u2', async () => 'next');
+      await flush();
+
+      await jest.advanceTimersByTimeAsync(100);
+      await firstRejection;
+      expect(controller.snapshot()).toMatchObject({ active: 1, pending: 1 });
+
+      await jest.advanceTimersByTimeAsync(50);
+      await expect(second).resolves.toBe('next');
+      expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
+    } finally {
+      stuck.resolve('late');
+      await flush();
+      jest.useRealTimers();
+    }
+  });
+
   test('times out queued work and removes it fairly', async () => {
     jest.useFakeTimers();
     try {
@@ -203,6 +237,95 @@ describe('TabCapacityReservations', () => {
     release();
     expect(() => capacity.reserve('u2')).not.toThrow();
   });
+
+  test('atomically reserves distinct recycle victims for concurrent creates at the limit', () => {
+    const victims = Array.from({ length: 9 }, (_, index) => ({ id: `tab-${index}` }));
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 10,
+      maxPerUser: 10,
+      getGlobalCount: () => 9,
+      getUserCount: () => 9,
+    });
+    const selectVictim = reserved => victims.find(victim => !reserved.has(victim));
+
+    const growth = capacity.reserve('u1', { selectVictim });
+    const replacement1 = capacity.reserve('u1', { selectVictim });
+    const replacement2 = capacity.reserve('u1', { selectVictim });
+
+    expect(growth.victim).toBeNull();
+    expect(replacement1.victim).toBe(victims[0]);
+    expect(replacement2.victim).toBe(victims[1]);
+
+    growth();
+    replacement1();
+    replacement2();
+  });
+
+  test('transfers pending capacity to a resident page without double-counting', () => {
+    let resident = 0;
+    const victim = { id: 'existing' };
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 2,
+      maxPerUser: 2,
+      getGlobalCount: () => resident,
+      getUserCount: () => resident,
+    });
+    const selectVictim = reserved => reserved.has(victim) ? null : victim;
+
+    const first = capacity.reserve('u1', { selectVictim });
+    resident = 1;
+    first.markCreated();
+
+    const second = capacity.reserve('u1', { selectVictim });
+    expect(second.victim).toBeNull();
+    resident = 2;
+    second.markCreated();
+
+    const replacement = capacity.reserve('u1', { selectVictim });
+    expect(replacement.victim).toBe(victim);
+    resident = 1;
+    replacement.markVictimRemoved();
+    resident = 2;
+    replacement.markCreated();
+
+    first();
+    second();
+    replacement();
+  });
+
+  test('releases an unconsumed recycle claim exactly once', () => {
+    const victim = { id: 'existing' };
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 1,
+      maxPerUser: 1,
+      getGlobalCount: () => 1,
+      getUserCount: () => 1,
+    });
+    const selectVictim = reserved => reserved.has(victim) ? null : victim;
+    const lease = capacity.reserve('u1', { selectVictim });
+    expect(lease.victim).toBe(victim);
+    lease();
+    lease();
+    const reacquired = capacity.reserve('u1', { selectVictim });
+    expect(reacquired.victim).toBe(victim);
+    reacquired();
+  });
+
+  test('returns a machine-readable global rejection when no recycle victim exists', () => {
+    const capacity = new TabCapacityReservations({
+      maxGlobal: 2,
+      maxPerUser: 2,
+      getGlobalCount: () => 2,
+      getUserCount: () => 0,
+      retryAfterSeconds: 4,
+    });
+
+    expect(() => capacity.reserve('new-user', { selectVictim: () => null })).toThrow(expect.objectContaining({
+      statusCode: 429,
+      code: 'tab_admission_global_limit',
+      retryAfter: 4,
+    }));
+  });
 });
 
 describe('pending tab creation and empty-session reaping', () => {
@@ -226,6 +349,43 @@ describe('pending tab creation and empty-session reaping', () => {
   test('never reaps a session that already contains a tab group', () => {
     const session = { tabGroups: new Map([['group', new Map()]]) };
     expect(canReapEmptySession(session)).toBe(false);
+  });
+
+  test('reports pending creations for every session-expiry path', () => {
+    const session = { tabGroups: new Map(), _pendingTabCreations: 0 };
+    expect(hasPendingTabCreations(session)).toBe(false);
+    const release = reservePendingTabCreation(session);
+    expect(hasPendingTabCreations(session)).toBe(true);
+    release();
+    expect(hasPendingTabCreations(session)).toBe(false);
+  });
+
+  test('emergency teardown aborts and releases every pending creation lease', () => {
+    const session = { tabGroups: new Map() };
+    const first = reservePendingTabCreation(session);
+    const second = reservePendingTabCreation(session);
+    const reason = Object.assign(new Error('session evicted'), { code: 'session_evicted' });
+
+    expect(first.signal.aborted).toBe(false);
+    expect(second.signal.aborted).toBe(false);
+    expect(abortPendingTabCreations(session, reason)).toBe(2);
+    expect(first.signal.reason).toBe(reason);
+    expect(second.signal.reason).toBe(reason);
+    expect(hasPendingTabCreations(session)).toBe(false);
+    expect(abortPendingTabCreations(session, reason)).toBe(0);
+  });
+});
+
+describe('session mapping identity', () => {
+  test('does not delete a replacement installed while an old session closes', () => {
+    const oldSession = { id: 'old' };
+    const replacement = { id: 'replacement' };
+    const sessions = new Map([['user-1', replacement]]);
+
+    expect(deleteSessionMappingIfCurrent(sessions, 'user-1', oldSession)).toBe(false);
+    expect(sessions.get('user-1')).toBe(replacement);
+    expect(deleteSessionMappingIfCurrent(sessions, 'user-1', replacement)).toBe(true);
+    expect(sessions.has('user-1')).toBe(false);
   });
 });
 
@@ -255,9 +415,68 @@ describe('sendTabAdmissionError', () => {
       retryAfter: 5,
     });
   });
+
+  test('normalizes a plain HTTP 429 into the admission contract', () => {
+    const response = {
+      headers: {}, statusCode: null, body: null,
+      set(name, value) { this.headers[name] = value; return this; },
+      status(value) { this.statusCode = value; return this; },
+      json(value) { this.body = value; return this; },
+    };
+    const error = Object.assign(new Error('limited'), { statusCode: 429 });
+    expect(sendTabAdmissionError(response, error, 'safe limited')).toBe(true);
+    expect(response.headers['Retry-After']).toBe('2');
+    expect(response.body).toEqual({
+      error: 'safe limited',
+      code: 'tab_admission_rejected',
+      retryAfter: 2,
+    });
+  });
+});
+
+describe('bounded page cleanup', () => {
+  test('returns after its deadline when page.close never settles', async () => {
+    jest.useFakeTimers();
+    try {
+      const closeGate = deferred();
+      const page = {
+        isClosed: () => false,
+        close: jest.fn(() => closeGate.promise),
+        removeAllListeners: jest.fn(),
+      };
+      const onTimeout = jest.fn();
+      const cleanup = closePageWithin(page, { timeoutMs: 100, onTimeout });
+
+      await jest.advanceTimersByTimeAsync(100);
+      await expect(cleanup).resolves.toBeUndefined();
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+      expect(page.removeAllListeners).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('awaitAbortableResource', () => {
+  test('rejects promptly on abort and closes a resource that resolves later', async () => {
+    const resource = deferred();
+    const abort = new AbortController();
+    const close = jest.fn(async () => {});
+    let settled = false;
+    const result = awaitAbortableResource(resource.promise, abort.signal, close);
+    result.catch(() => { settled = true; });
+
+    abort.abort(new Error('request timed out'));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).toBe(true);
+
+    const latePage = { id: 'late-page' };
+    resource.resolve(latePage);
+    await flush();
+    expect(close).toHaveBeenCalledWith(latePage);
+    await expect(result).rejects.toThrow('request timed out');
+  });
+
   test('closes a resource that resolves after its operation was aborted', async () => {
     const resource = deferred();
     const abort = new AbortController();
@@ -269,6 +488,63 @@ describe('awaitAbortableResource', () => {
 
     await expect(result).rejects.toThrow('request timed out');
     expect(close).toHaveBeenCalledWith({ id: 'late-page' });
+  });
+
+  test('unregisters and closes promptly when aborted work never settles', async () => {
+    const abort = new AbortController();
+    const work = deferred();
+    const registered = new Map();
+    const close = jest.fn(async () => {});
+    const resource = { id: 'tab-stuck' };
+    let settled = false;
+
+    const result = withAbortableResource({
+      create: async () => resource,
+      signal: abort.signal,
+      register: async (value) => registered.set(value.id, value),
+      unregister: async (value) => registered.delete(value.id),
+      cleanup: close,
+      operation: async () => work.promise,
+    });
+    result.catch(() => { settled = true; });
+    await new Promise(setImmediate);
+
+    abort.abort(new Error('request timed out'));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).toBe(true);
+    expect(registered.size).toBe(0);
+    expect(close).toHaveBeenCalledWith(resource);
+    await expect(result).rejects.toThrow('request timed out');
+  });
+
+  test('bounds cleanup after abort even when cleanup never settles', async () => {
+    jest.useFakeTimers();
+    const cleanupGate = deferred();
+    const work = deferred();
+    try {
+      const abort = new AbortController();
+      let settled = false;
+      const result = withAbortableResource({
+        create: async () => ({ id: 'bounded-cleanup' }),
+        signal: abort.signal,
+        register: async () => {},
+        unregister: async () => {},
+        cleanup: async () => cleanupGate.promise,
+        cleanupTimeoutMs: 50,
+        operation: async () => work.promise,
+      });
+      result.catch(() => { settled = true; });
+      await Promise.resolve();
+      await Promise.resolve();
+      abort.abort(new Error('request timed out'));
+      await jest.advanceTimersByTimeAsync(50);
+      expect(settled).toBe(true);
+      await expect(result).rejects.toThrow('request timed out');
+    } finally {
+      cleanupGate.resolve();
+      work.resolve();
+      jest.useRealTimers();
+    }
   });
 
   test('unregisters and closes a managed resource when work is aborted', async () => {
@@ -292,7 +568,7 @@ describe('awaitAbortableResource', () => {
     abort.abort(new Error('request timed out'));
     work.reject(new Error('page closed'));
 
-    await expect(result).rejects.toThrow('page closed');
+    await expect(result).rejects.toThrow('request timed out');
     expect(registered.size).toBe(0);
     expect(close).toHaveBeenCalledWith(resource);
   });

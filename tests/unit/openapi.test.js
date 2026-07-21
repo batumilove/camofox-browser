@@ -137,6 +137,15 @@ describe('OpenAPI spec', () => {
     expect(createTab.requestBody.content['application/json']).toBeDefined();
   });
 
+  test('tab creation routes document machine-readable 429 and Retry-After', () => {
+    for (const path of ['/tabs', '/tabs/open']) {
+      const response = spec.paths[path]?.post?.responses?.['429'];
+      expect(response).toBeDefined();
+      expect(response.headers?.['Retry-After']).toBeDefined();
+      expect(response.content?.['application/json']?.schema?.$ref).toBe('#/components/schemas/TabAdmissionError');
+    }
+  });
+
   test('legacy routes are marked deprecated', () => {
     const legacyPaths = {
       '/act': 'post',

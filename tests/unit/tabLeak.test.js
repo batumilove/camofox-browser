@@ -2,12 +2,13 @@
  * Tests for tab leak fixes: safePageClose, getTotalTabCount, and orphan page reaper.
  *
  * Validates:
- * 1. safePageClose force-closes pages on timeout and cleans up listeners
+ * 1. safePageClose is single-attempt and bounded, then defers orphan cleanup
  * 2. getTotalTabCount uses real Playwright page count for backpressure
  * 3. Orphan page reaper identifies and closes untracked pages
  */
 import { describe, test, expect } from '@jest/globals';
 import { jest } from '@jest/globals';
+import { closePageWithin, hasPendingTabCreations } from '../../lib/tab-admission.js';
 
 // ============================================================================
 // safePageClose (extracted logic)
@@ -15,23 +16,18 @@ import { jest } from '@jest/globals';
 
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 
-/**
- * Mirrors the safePageClose logic from server.js.
- * Returns: { action: 'skipped'|'closed'|'force_closed', removeAllListenersCalled: boolean }
- */
-async function safePageClose(page) {
+/** Mirrors the bounded single-attempt cleanup used by server.js. */
+async function safePageClose(page, timeoutMs = PAGE_CLOSE_TIMEOUT_MS) {
   if (!page || page.isClosed()) return { action: 'skipped', removeAllListenersCalled: false };
-  try {
-    await Promise.race([
-      page.close({ runBeforeUnload: false }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), PAGE_CLOSE_TIMEOUT_MS)),
-    ]);
-    return { action: 'closed', removeAllListenersCalled: false };
-  } catch (e) {
-    try { await page.close({ runBeforeUnload: false }); } catch (_) {}
-    page.removeAllListeners();
-    return { action: 'force_closed', removeAllListenersCalled: true };
-  }
+  let deferred = false;
+  await closePageWithin(page, {
+    timeoutMs,
+    onTimeout: () => { deferred = true; },
+  });
+  return {
+    action: deferred ? 'deferred' : 'closed',
+    removeAllListenersCalled: deferred,
+  };
 }
 
 // ============================================================================
@@ -65,7 +61,7 @@ function getTotalTabCount(sessions) {
 function findOrphanPages(sessions) {
   const orphans = [];
   for (const session of sessions.values()) {
-    if (session._closing) continue;
+    if (session._closing || hasPendingTabCreations(session)) continue;
     let contextPages;
     try {
       contextPages = session.context.pages();
@@ -136,68 +132,40 @@ describe('safePageClose', () => {
     expect(result.removeAllListenersCalled).toBe(false);
   });
 
-  test('force-closes and removes listeners when close throws', async () => {
-    let callCount = 0;
+  test('defers failed close to the orphan reaper without a second unbounded call', async () => {
     const page = {
       isClosed: () => false,
-      close: jest.fn(async () => {
-        callCount++;
-        if (callCount === 1) throw new Error('close failed');
-        // Second call succeeds (force-close)
-      }),
+      close: jest.fn(async () => { throw new Error('close failed'); }),
       removeAllListeners: jest.fn(),
     };
     const result = await safePageClose(page);
-    expect(result.action).toBe('force_closed');
+    expect(result.action).toBe('deferred');
     expect(result.removeAllListenersCalled).toBe(true);
-    expect(page.close).toHaveBeenCalledTimes(2);
+    expect(page.close).toHaveBeenCalledTimes(1);
     expect(page.removeAllListeners).toHaveBeenCalled();
   });
 
-  test('force-closes when page.close hangs past timeout', async () => {
-    // Use a very short timeout for test speed
-    const SHORT_TIMEOUT = 50;
-    async function safePageCloseShort(page) {
-      if (!page || page.isClosed()) return { action: 'skipped', removeAllListenersCalled: false };
-      try {
-        await Promise.race([
-          page.close({ runBeforeUnload: false }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), SHORT_TIMEOUT)),
-        ]);
-        return { action: 'closed', removeAllListenersCalled: false };
-      } catch (e) {
-        try { await page.close({ runBeforeUnload: false }); } catch (_) {}
-        page.removeAllListeners();
-        return { action: 'force_closed', removeAllListenersCalled: true };
-      }
-    }
-
-    // Simulate a page whose close() never resolves (hung Firefox process)
-    let callCount = 0;
+  test('returns after timeout without making a second close call', async () => {
     const page = {
       isClosed: () => false,
-      close: jest.fn(() => {
-        callCount++;
-        if (callCount === 1) return new Promise(() => {}); // never resolves
-        return Promise.resolve(); // force-close succeeds
-      }),
+      close: jest.fn(() => new Promise(() => {})),
       removeAllListeners: jest.fn(),
     };
-    const result = await safePageCloseShort(page);
-    expect(result.action).toBe('force_closed');
+    const result = await safePageClose(page, 50);
+    expect(result.action).toBe('deferred');
     expect(result.removeAllListenersCalled).toBe(true);
     expect(page.removeAllListeners).toHaveBeenCalled();
-    expect(page.close).toHaveBeenCalledTimes(2);
+    expect(page.close).toHaveBeenCalledTimes(1);
   });
 
-  test('handles force-close also failing gracefully', async () => {
+  test('handles a close rejection without leaking the rejection', async () => {
     const page = {
       isClosed: () => false,
       close: jest.fn(async () => { throw new Error('always fails'); }),
       removeAllListeners: jest.fn(),
     };
     const result = await safePageClose(page);
-    expect(result.action).toBe('force_closed');
+    expect(result.action).toBe('deferred');
     expect(page.removeAllListeners).toHaveBeenCalled();
   });
 
@@ -327,6 +295,17 @@ describe('findOrphanPages (orphan page reaper)', () => {
         tabGroups: new Map(),
       }],
     ]);
+    expect(findOrphanPages(sessions)).toEqual([]);
+  });
+
+  test('skips sessions while a page creation is pending', () => {
+    const pageBetweenAcquisitionAndRegistration = { id: 'pending-page' };
+    const sessions = new Map([['user1', {
+      _closing: false,
+      _pendingTabCreations: 1,
+      context: { pages: () => [pageBetweenAcquisitionAndRegistration] },
+      tabGroups: new Map(),
+    }]]);
     expect(findOrphanPages(sessions)).toEqual([]);
   });
 

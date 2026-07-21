@@ -51,8 +51,13 @@ import {
 } from './lib/browser-errors.js';
 import {
   TabAdmissionController,
+  TabAdmissionError,
   TabCapacityReservations,
+  abortPendingTabCreations,
   canReapEmptySession,
+  closePageWithin,
+  deleteSessionMappingIfCurrent,
+  hasPendingTabCreations,
   reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
@@ -643,22 +648,12 @@ async function withUserLimit(userId, operation) {
 }
 
 async function safePageClose(page) {
-  if (!page || page.isClosed()) return;
-  try {
-    await Promise.race([
-      page.close({ runBeforeUnload: false }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), PAGE_CLOSE_TIMEOUT_MS)),
-    ]);
-  } catch (e) {
-    log('warn', 'page close timed out or failed, force-closing', { error: e.message });
-    try {
-      await Promise.race([
-        page.close({ runBeforeUnload: false }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('page force-close timed out')), PAGE_FORCE_CLOSE_TIMEOUT_MS)),
-      ]);
-    } catch (_) {}
-    page.removeAllListeners();
-  }
+  await closePageWithin(page, {
+    timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
+    onTimeout: (error) => {
+      log('warn', 'page close timed out or failed; leaving page for orphan reaper', { error: error.message });
+    },
+  });
 }
 
 // Detect host OS for fingerprint generation
@@ -713,11 +708,28 @@ function getUserTabCount(userKey) {
   return total;
 }
 
+function getUserResidentPageCount(userKey) {
+  const session = sessions.get(userKey);
+  if (!session) return 0;
+  const registered = getUserTabCount(userKey);
+  try {
+    return Math.max(registered, session.context.pages().length);
+  } catch (_) {
+    return registered;
+  }
+}
+
+function getTotalResidentPageCount() {
+  let total = 0;
+  for (const key of sessions.keys()) total += getUserResidentPageCount(key);
+  return total;
+}
+
 const tabCapacity = new TabCapacityReservations({
   maxGlobal: MAX_TABS_GLOBAL,
   maxPerUser: MAX_TABS_PER_SESSION,
-  getGlobalCount: getTotalTabCount,
-  getUserCount: getUserTabCount,
+  getGlobalCount: getTotalResidentPageCount,
+  getUserCount: getUserResidentPageCount,
   retryAfterSeconds: 2,
   onRejected: () => tabAdmissionRejectedTotal.inc(),
 });
@@ -1309,6 +1321,12 @@ async function closeSession(userId, session, {
   if (!session) return;
 
   const key = normalizeUserId(userId);
+  session._closing = true;
+  const evictionError = Object.assign(new Error(`Session closing: ${reason}`), {
+    code: 'session_evicted',
+    reason,
+  });
+  abortPendingTabCreations(session, evictionError);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
@@ -1320,7 +1338,7 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroying', { userId: key, reason, context: session.context });
   if (session.tracePath) {
     try {
       await session.context.tracing.stop({ path: session.tracePath });
@@ -1331,8 +1349,8 @@ async function closeSession(userId, session, {
   }
 
   await session.context.close().catch(() => {});
-  sessions.delete(key);
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  deleteSessionMappingIfCurrent(sessions, key, session);
+  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason, context: session.context });
 
   refreshActiveTabsGauge();
 }
@@ -1486,6 +1504,7 @@ async function createPageWithRecoveryForUser(userId, session, { trace = false, r
     getSession,
     log,
     reservePendingCreation,
+    cleanupLatePage: safePageClose,
   });
 }
 
@@ -1692,37 +1711,55 @@ async function destroyTimedOutTab(session, tabId, reason, userId) {
 }
 
 /**
- * Recycle the oldest (least-used) tab in a session to free a slot.
- * Closes the old tab's page and removes it from its group.
- * Returns { recycledTabId, recycledFromGroup } or null if no tab to recycle.
+ * Select the least-used tab without mutating the session. Reserved victims are
+ * excluded so concurrent creation leases cannot recycle the same tab twice.
  */
-async function recycleOldestTab(session, reqId, userId) {
+function selectOldestTabForRecycling(session, reservedVictims = new Set()) {
   let oldestTab = null;
-  let oldestGroup = null;
-  let oldestGroupKey = null;
-  let oldestTabId = null;
-  for (const [gKey, group] of session.tabGroups) {
-    for (const [tid, ts] of group) {
-      if (!oldestTab || ts.toolCalls < oldestTab.toolCalls) {
-        oldestTab = ts;
-        oldestGroup = group;
-        oldestGroupKey = gKey;
-        oldestTabId = tid;
-      }
+  for (const group of session.tabGroups.values()) {
+    for (const tabState of group.values()) {
+      if (reservedVictims.has(tabState)) continue;
+      if (!oldestTab || tabState.toolCalls < oldestTab.toolCalls) oldestTab = tabState;
     }
   }
-  if (!oldestTab) return null;
+  return oldestTab;
+}
 
-  await safePageClose(oldestTab.page);
-  oldestGroup.delete(oldestTabId);
-  if (oldestGroup.size === 0) session.tabGroups.delete(oldestGroupKey);
-  const lock = tabLocks.get(oldestTabId);
-  if (lock) { lock.drain(); tabLocks.delete(oldestTabId); }
+/** Close and remove the exact tab selected by an atomic capacity lease. */
+async function recycleReservedTab(session, victim, reqId, userId) {
+  if (!victim) return null;
+  let victimGroup = null;
+  let victimGroupKey = null;
+  let victimTabId = null;
+  for (const [groupKey, group] of session.tabGroups) {
+    for (const [tabId, tabState] of group) {
+      if (tabState !== victim) continue;
+      victimGroup = group;
+      victimGroupKey = groupKey;
+      victimTabId = tabId;
+      break;
+    }
+    if (victimTabId) break;
+  }
+  if (!victimGroup) return null;
+
+  await safePageClose(victim.page);
+  if (!victim.page.isClosed?.()) {
+    throw new TabAdmissionError('Recyclable tab did not close before the cleanup deadline', {
+      code: 'tab_admission_recycle_cleanup_timeout',
+      retryAfter: 2,
+    });
+  }
+  victimGroup.delete(victimTabId);
+  if (victimGroup.size === 0) session.tabGroups.delete(victimGroupKey);
+  const lock = tabLocks.get(victimTabId);
+  if (lock) { lock.drain(); tabLocks.delete(victimTabId); }
   refreshTabLockQueueDepth();
+  refreshActiveTabsGauge();
   tabsRecycledTotal.inc();
-  pluginEvents.emit('tab:recycled', { userId: userId || null, tabId: oldestTabId });
-  log('info', 'tab recycled (limit reached)', { reqId, recycledTabId: oldestTabId, recycledFromGroup: oldestGroupKey });
-  return { recycledTabId: oldestTabId, recycledFromGroup: oldestGroupKey };
+  pluginEvents.emit('tab:recycled', { userId: userId || null, tabId: victimTabId });
+  log('info', 'tab recycled (limit reached)', { reqId, recycledTabId: victimTabId, recycledFromGroup: victimGroupKey });
+  return { recycledTabId: victimTabId, recycledFromGroup: victimGroupKey };
 }
 
 async function destroySession(userId, { reason = 'destroy_session' } = {}) {
@@ -1855,6 +1892,7 @@ async function camofoxPressureCleanup(options = {}) {
   const candidates = [];
 
   for (const [userId, session] of sessions) {
+    if (hasPendingTabCreations(session)) continue;
     for (const [listItemId, group] of session.tabGroups) {
       for (const [tabId, tabState] of group) {
         const lockState = pressureLockState(tabId);
@@ -1939,7 +1977,7 @@ async function camofoxPressureCleanup(options = {}) {
       for (const [listItemId, group] of Array.from(session.tabGroups.entries())) {
         if (group.size === 0) session.tabGroups.delete(listItemId);
       }
-      if (closeEmptySessions && session.tabGroups.size === 0 && !hasActivePageLeases(session)) {
+      if (closeEmptySessions && canReapEmptySession(session) && !hasActivePageLeases(session)) {
         session._closing = true;
         await closeSession(userId, session, { reason: 'pressure_cleanup_empty_session', clearDownloads: true, clearLocks: true });
         sessionsExpiredTotal.inc();
@@ -2919,32 +2957,37 @@ app.post('/tabs', async (req, res) => {
       }
       let session = await getSession(userId, { trace: !!trace });
 
-      let totalTabs = 0;
-      for (const group of session.tabGroups.values()) totalTabs += group.size;
-
-      // Preserve current recycling behavior while reserving the slot so
-      // concurrent creations cannot oversubscribe the configured limits.
-      if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-        const recycled = await recycleOldestTab(session, req.reqId, userId);
-        if (!recycled) {
-          throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
-        }
-      }
-
-      const releaseCapacity = tabCapacity.reserve(normalizeUserId(userId));
-      try {
-        const tabId = fly.makeTabId();
-        const createAttempt = async (initialSession) => {
-          let effectiveSession = initialSession;
-          let group;
-          let tabState;
-          return withAbortableResource({
+      const tabId = fly.makeTabId();
+      const createAttempt = async (initialSession) => {
+        let effectiveSession = initialSession;
+        let group;
+        let tabState;
+        const releaseSessionAttempt = reservePendingTabCreation(initialSession);
+        let releaseCapacity;
+        try {
+          releaseCapacity = tabCapacity.reserve(normalizeUserId(userId), {
+            selectVictim: reservedVictims => selectOldestTabForRecycling(initialSession, reservedVictims),
+          });
+          if (releaseSessionAttempt.signal.aborted) throw releaseSessionAttempt.signal.reason;
+          if (releaseCapacity.victim) {
+            const recycled = await recycleReservedTab(initialSession, releaseCapacity.victim, req.reqId, userId);
+            if (!recycled) {
+              throw new TabAdmissionError('Reserved recycle candidate is no longer available', {
+                code: 'tab_admission_recycle_lost',
+                retryAfter: 2,
+              });
+            }
+            releaseCapacity.markVictimRemoved();
+          }
+          if (releaseSessionAttempt.signal.aborted) throw releaseSessionAttempt.signal.reason;
+          return await withAbortableResource({
             create: async () => {
               const created = await createPageWithRecoveryForUser(userId, effectiveSession, {
                 trace: !!trace,
                 reservePendingCreation: reservePendingTabCreation,
               });
               effectiveSession = created.session;
+              releaseCapacity.markCreated();
               return { page: created.page, lease: created.lease };
             },
             signal,
@@ -2971,6 +3014,7 @@ app.post('/tabs', async (req, res) => {
                 await safePageClose(resource.page);
               }
             },
+            cleanupTimeoutMs: PAGE_CLOSE_TIMEOUT_MS + 100,
             operation: async ({ page }) => {
               if (url) {
                 const urlErr = validateUrl(url);
@@ -2985,31 +3029,27 @@ app.post('/tabs', async (req, res) => {
               return { tabId, url: page.url() };
             },
           });
-        };
-
-        try {
-          return await createAttempt(session);
-        } catch (navErr) {
-          if (!(url && (isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions)) {
-            if (url && recordNavFailure(userId)) {
-              await recoverUserSession(userId, 'tab_create_nav_failure');
-            }
-            throw navErr;
-          }
-          log('warn', 'tab create navigate failed, retrying with fresh proxy', {
-            reqId: req.reqId, tabId, error: navErr.message,
-          });
-          browserRestartsTotal.labels('proxy_retry').inc();
-          const key = normalizeUserId(userId);
-          const oldSession = sessions.get(key);
-          if (oldSession) {
-            await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-          }
-          session = await getSession(userId, { trace: !!trace });
-          return createAttempt(session);
+        } finally {
+          releaseCapacity?.();
+          releaseSessionAttempt();
         }
-      } finally {
-        releaseCapacity();
+      };
+
+      try {
+        return await createAttempt(session);
+      } catch (navErr) {
+        if (!(url && (isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions)) throw navErr;
+        log('warn', 'tab create navigate failed, retrying with fresh proxy', {
+          reqId: req.reqId, tabId, error: navErr.message,
+        });
+        browserRestartsTotal.labels('proxy_retry').inc();
+        const key = normalizeUserId(userId);
+        const oldSession = sessions.get(key);
+        if (oldSession) {
+          await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
+        }
+        session = await getSession(userId, { trace: !!trace });
+        return createAttempt(session);
       }
     });
 
@@ -5601,7 +5641,7 @@ app.delete('/sessions/:userId', async (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of Array.from(sessions.entries())) {
-    if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+    if (now - session.lastAccess > SESSION_TIMEOUT_MS && !hasPendingTabCreations(session)) {
       session._closing = true;
       const idleMs = now - session.lastAccess;
       sessionsExpiredTotal.inc();
@@ -5634,7 +5674,7 @@ if (FLY_MACHINE_ID) {
       let oldestKey = null;
       let oldestAccess = Infinity;
       for (const [key, session] of sessions) {
-        if (session._closing || hasActivePageLeases(session)) continue;
+        if (session._closing || hasPendingTabCreations(session) || hasActivePageLeases(session)) continue;
         if (session.lastAccess < oldestAccess) {
           oldestAccess = session.lastAccess;
           oldestKey = key;
@@ -5713,7 +5753,7 @@ setInterval(() => {
 setInterval(() => {
   let reaped = 0;
   for (const session of sessions.values()) {
-    if (session._closing) continue;
+    if (session._closing || hasPendingTabCreations(session)) continue;
     let contextPages;
     try {
       contextPages = session.context.pages();
@@ -5926,6 +5966,16 @@ app.get('/tabs', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Tab admission limit, queue overflow, or creation timeout.
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/TabAdmissionError'
  */
 app.post('/tabs/open', async (req, res) => {
   try {
@@ -5936,38 +5986,98 @@ app.post('/tabs/open', async (req, res) => {
     if (!url) {
       return res.status(400).json({ error: 'url is required' });
     }
-    
+
     const urlErr = validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
-    
-    let session = await getSession(userId);
-    
-    // Recycle oldest tab when limits are reached instead of rejecting
-    let totalTabs = 0;
-    for (const g of session.tabGroups.values()) totalTabs += g.size;
-    if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId, userId);
-      if (!recycled) {
-        return res.status(429).json({ error: 'Maximum tabs per session reached' });
-      }
-    }
-    
-    let group = getTabGroup(session, listItemId);
-    
-    let { page, lease } = await createLeasedPage(session);
-    const tabId = fly.makeTabId();
-    let tabState = createTabState(page);
-    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-    group.set(tabId, tabState);
-    releasePageLease(session, lease);
-    attachPopupHandler(page, userId, listItemId);
-    refreshActiveTabsGauge();
-    
-    try {
-      await withPageLoadDuration('open_url', () => navigatePage(page, url));
-      recordNavSuccess(userId);
-    } catch (navErr) {
-      if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
+
+    const result = await withTabAdmission(userId, async (signal) => {
+      let session = await getSession(userId);
+      const tabId = fly.makeTabId();
+      const createAttempt = async (initialSession) => {
+        let effectiveSession = initialSession;
+        let group;
+        let tabState;
+        const releaseSessionAttempt = reservePendingTabCreation(initialSession);
+        let releaseCapacity;
+        try {
+          releaseCapacity = tabCapacity.reserve(normalizeUserId(userId), {
+            selectVictim: reservedVictims => selectOldestTabForRecycling(initialSession, reservedVictims),
+          });
+          if (releaseSessionAttempt.signal.aborted) throw releaseSessionAttempt.signal.reason;
+          if (releaseCapacity.victim) {
+            const recycled = await recycleReservedTab(initialSession, releaseCapacity.victim, req.reqId, userId);
+            if (!recycled) {
+              throw new TabAdmissionError('Reserved recycle candidate is no longer available', {
+                code: 'tab_admission_recycle_lost',
+                retryAfter: 2,
+              });
+            }
+            releaseCapacity.markVictimRemoved();
+          }
+          if (releaseSessionAttempt.signal.aborted) throw releaseSessionAttempt.signal.reason;
+          return await withAbortableResource({
+            create: async () => {
+              const created = await createPageWithRecoveryForUser(userId, effectiveSession, {
+                reservePendingCreation: reservePendingTabCreation,
+              });
+              effectiveSession = created.session;
+              releaseCapacity.markCreated();
+              return { page: created.page, lease: created.lease };
+            },
+            signal,
+            register: async (resource) => {
+              group = getTabGroup(effectiveSession, listItemId);
+              tabState = createTabState(resource.page);
+              attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+              group.set(tabId, tabState);
+              releasePageLease(effectiveSession, resource.lease);
+              resource.lease = null;
+              attachPopupHandler(resource.page, userId, listItemId);
+              refreshActiveTabsGauge();
+            },
+            unregister: async () => {
+              if (group?.get(tabId) === tabState) group.delete(tabId);
+              if (group?.size === 0) effectiveSession.tabGroups.delete(listItemId);
+              refreshActiveTabsGauge();
+            },
+            cleanup: async (resource) => {
+              if (resource.lease) {
+                await closeLeasedPage(effectiveSession, resource.page, resource.lease);
+                resource.lease = null;
+              } else {
+                await safePageClose(resource.page);
+              }
+            },
+            cleanupTimeoutMs: PAGE_CLOSE_TIMEOUT_MS + 100,
+            operation: async ({ page }) => {
+              await withPageLoadDuration('open_url', () => navigatePage(page, url));
+              tabState.visitedUrls.add(url);
+              recordNavSuccess(userId);
+              log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
+              return {
+                ok: true,
+                targetId: tabId,
+                tabId,
+                url: page.url(),
+                title: await page.title().catch(() => ''),
+              };
+            },
+          });
+        } finally {
+          releaseCapacity?.();
+          releaseSessionAttempt();
+        }
+      };
+
+      try {
+        return await createAttempt(session);
+      } catch (navErr) {
+        if (!((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions)) {
+          if (recordNavFailure(userId)) {
+            await recoverUserSession(userId, 'tab_open_nav_failure');
+          }
+          throw navErr;
+        }
         log('warn', 'tab open failed, retrying with fresh proxy', {
           reqId: req.reqId, tabId, error: navErr.message,
         });
@@ -5978,35 +6088,14 @@ app.post('/tabs/open', async (req, res) => {
           await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
         }
         session = await getSession(userId);
-        group = getTabGroup(session, listItemId);
-        ({ page, lease } = await createLeasedPage(session));
-        tabState = createTabState(page);
-        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-        group.set(tabId, tabState);
-        releasePageLease(session, lease);
-        attachPopupHandler(page, userId, listItemId);
-        refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => navigatePage(page, url));
-        recordNavSuccess(userId);
-      } else {
-        if (recordNavFailure(userId)) {
-          await recoverUserSession(userId, 'tab_open_nav_failure');
-        }
-        throw navErr;
+        return createAttempt(session);
       }
-    }
-    tabState.visitedUrls.add(url);
-    
-    log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
-    res.json({ 
-      ok: true,
-      targetId: tabId,
-      tabId,
-      url: page.url(),
-      title: await page.title().catch(() => '')
     });
+
+    res.json(result);
   } catch (err) {
     log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
+    if (sendTabAdmissionError(res, err, safeError(err))) return;
     handleRouteError(err, req, res);
   }
 });
