@@ -35,6 +35,13 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  app.get('/slow', (req, res) => {
+    const delayMs = Math.min(1000, Math.max(0, Number(req.query.ms) || 500));
+    setTimeout(() => {
+      res.send('<!DOCTYPE html><html><head><title>Slow Page</title></head><body><h1>Slow Page</h1></body></html>');
+    }, delayMs);
+  });
   
   // Page with multiple links for links extraction test
   app.get('/links', (req, res) => {

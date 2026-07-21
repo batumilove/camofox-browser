@@ -2560,6 +2560,23 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Tab admission limit, queue overflow, or creation timeout.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TabAdmissionError"
+                }
+              }
+            }
           }
         }
       }
