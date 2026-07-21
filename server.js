@@ -1471,7 +1471,7 @@ async function closeLeasedPage(session, page, lease) {
   }
 }
 
-async function createPageWithRecoveryForUser(userId, session, { trace = false } = {}) {
+async function createPageWithRecoveryForUser(userId, session, { trace = false, reservePendingCreation } = {}) {
   const key = normalizeUserId(userId);
   return createPageWithSessionRecovery({
     userId: key,
@@ -1485,6 +1485,7 @@ async function createPageWithRecoveryForUser(userId, session, { trace = false } 
     destroySession,
     getSession,
     log,
+    reservePendingCreation,
   });
 }
 
@@ -2937,14 +2938,15 @@ app.post('/tabs', async (req, res) => {
           let effectiveSession = initialSession;
           let group;
           let tabState;
-          const releasePendingCreation = reservePendingTabCreation(effectiveSession);
-          try {
-            return await withAbortableResource({
-              create: async () => {
-                const created = await createPageWithRecoveryForUser(userId, effectiveSession, { trace: !!trace });
-                effectiveSession = created.session;
-                return { page: created.page, lease: created.lease };
-              },
+          return withAbortableResource({
+            create: async () => {
+              const created = await createPageWithRecoveryForUser(userId, effectiveSession, {
+                trace: !!trace,
+                reservePendingCreation: reservePendingTabCreation,
+              });
+              effectiveSession = created.session;
+              return { page: created.page, lease: created.lease };
+            },
             signal,
             register: async (resource) => {
               group = getTabGroup(effectiveSession, resolvedSessionKey);
@@ -2982,10 +2984,7 @@ app.post('/tabs', async (req, res) => {
               log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
               return { tabId, url: page.url() };
             },
-            });
-          } finally {
-            releasePendingCreation();
-          }
+          });
         };
 
         try {
