@@ -37,6 +37,7 @@ import { createReporter, createTabHealthTracker, collectResourceSnapshot, classi
 import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
+import { BrowserLaunchCoordinator } from './lib/browser-launch-coordinator.js';
 import {
   TabAdmissionController,
   TabCapacityReservations,
@@ -606,7 +607,6 @@ const tabCapacity = new TabCapacityReservations({
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
 let browserIdleTimer = null;
-let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
 
 if (BROWSER_IDLE_TIMEOUT_MS <= 0) {
@@ -654,7 +654,7 @@ function camoufoxInstallRemediation() {
 }
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || browser || browserLaunchPromise) return;
+  if (browserWarmRetryTimer || browser || browserLaunchCoordinator.inFlight) return;
   browserWarmRetryTimer = setTimeout(async () => {
     browserWarmRetryTimer = null;
     try {
@@ -703,7 +703,7 @@ async function restartBrowser(reason) {
     await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
     await closeBrowserFully(`browser_restart:${reason}`);
     pluginEvents.emit('browser:closed', { reason });
-    browserLaunchPromise = null;
+    browserLaunchCoordinator.invalidate(new Error(`Browser launch invalidated by restart: ${reason}`));
     await ensureBrowser();
     healthState.consecutiveNavFailures = 0;
     healthState.lastSuccessfulNav = Date.now();
@@ -775,16 +775,48 @@ async function probeGoogleSearch(candidateBrowser) {
   }
 }
 
-function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
+function attachBrowserCleanup(candidateBrowser, localVirtualDisplay, launchProxy) {
   const origClose = candidateBrowser.close.bind(candidateBrowser);
+  let cleaned = false;
   candidateBrowser.close = async (...args) => {
-    await origClose(...args);
-    browserLaunchProxy = null;
-    if (localVirtualDisplay) {
-      localVirtualDisplay.kill();
-      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+    try {
+      return await origClose(...args);
+    } finally {
+      if (!cleaned) {
+        cleaned = true;
+        if (browserLaunchProxy === launchProxy) browserLaunchProxy = null;
+        if (localVirtualDisplay) {
+          localVirtualDisplay.kill();
+          if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+        }
+      }
     }
   };
+}
+
+async function discardBrowserLaunchCandidate(candidate, token) {
+  if (!candidate) return;
+  let closeTimer = null;
+  try {
+    await Promise.race([
+      candidate.browser.close(),
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => reject(new Error('stale browser close timeout')), 5000);
+      }),
+    ]);
+  } catch (err) {
+    log('warn', 'stale browser launch cleanup failed or timed out', {
+      generation: token.generation,
+      pid: candidate.pid,
+      error: err.message,
+    });
+  } finally {
+    clearTimeout(closeTimer);
+    // Never PID-scan or signal from stale-generation cleanup: a newer launch
+    // may already own the matching browser/Xvfb process names, and PID reuse
+    // makes delayed raw signals unsafe. The owned display is safe to kill.
+    candidate.virtualDisplay?.kill();
+  }
 }
 
 /**
@@ -807,6 +839,7 @@ async function closeBrowserFully(reason) {
 }
 
 async function _closeBrowserFullyImpl(reason) {
+  browserLaunchCoordinator.invalidate(new Error(`Browser launch invalidated by close: ${reason}`));
   const b = browser;
   if (!b) return;
   clearBrowserIdleTimer();
@@ -991,13 +1024,14 @@ function _countActiveHandles() {
   try { return process._getActiveHandles().length; } catch { return null; }
 }
 
-async function launchBrowserInstance() {
+async function launchBrowserInstance(launchToken) {
   const hostOS = getHostOS();
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
   const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (!launchToken.active) throw new Error(`Browser launch generation ${launchToken.generation} invalidated`);
     const launchProxy = proxyPool
       ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
       : null;
@@ -1046,8 +1080,29 @@ async function launchBrowserInstance() {
 
       candidateBrowser = await firefox.launch(options);
 
+      if (!launchToken.active) {
+        await discardBrowserLaunchCandidate({
+          browser: candidateBrowser,
+          virtualDisplay: localVirtualDisplay,
+          pid: candidateBrowser.process?.()?.pid ?? null,
+        }, launchToken);
+        candidateBrowser = null;
+        localVirtualDisplay = null;
+        throw new Error(`Browser launch generation ${launchToken.generation} invalidated`);
+      }
+
       if (proxyPool?.canRotateSessions) {
         const probe = await probeGoogleSearch(candidateBrowser);
+        if (!launchToken.active) {
+          await discardBrowserLaunchCandidate({
+            browser: candidateBrowser,
+            virtualDisplay: localVirtualDisplay,
+            pid: candidateBrowser.process?.()?.pid ?? null,
+          }, launchToken);
+          candidateBrowser = null;
+          localVirtualDisplay = null;
+          throw new Error(`Browser launch generation ${launchToken.generation} invalidated`);
+        }
         if (!probe.ok) {
           log('warn', 'browser launch google probe failed', {
             attempt,
@@ -1056,8 +1111,14 @@ async function launchBrowserInstance() {
             url: probe.url,
           });
           if (attempt < maxAttempts) {
-            await candidateBrowser.close().catch(() => {});
-            if (localVirtualDisplay) localVirtualDisplay.kill();
+            await discardBrowserLaunchCandidate({
+              browser: candidateBrowser,
+              virtualDisplay: localVirtualDisplay,
+              pid: candidateBrowser.process?.()?.pid ?? null,
+            }, launchToken);
+            candidateBrowser = null;
+            localVirtualDisplay = null;
+            if (!launchToken.active) throw new Error(`Browser launch generation ${launchToken.generation} invalidated`);
             continue;
           }
           // Last attempt: accept browser in degraded mode rather than death-spiraling.
@@ -1069,23 +1130,16 @@ async function launchBrowserInstance() {
         }
       }
 
-      virtualDisplay = localVirtualDisplay;
-      browserLaunchProxy = launchProxy;
-      _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
-      browser = candidateBrowser; // publish AFTER PID is captured
-      _lastBrowserRestartAt = Date.now();
-      attachBrowserCleanup(browser, localVirtualDisplay);
-      pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
-
-      log('info', 'camoufox launched', {
+      return {
+        browser: candidateBrowser,
+        virtualDisplay: localVirtualDisplay,
+        proxy: launchProxy,
+        pid: candidateBrowser.process?.()?.pid ?? null,
+        display: vdDisplay,
         attempt,
         maxAttempts,
-        virtualDisplay: useVirtualDisplay,
-        proxyMode: proxyPool?.mode || null,
-        proxyServer: launchProxy?.server || null,
-        proxySession: launchProxy?.sessionId || null,
-      });
-      return browser;
+        useVirtualDisplay,
+      };
     } catch (err) {
       lastError = err;
       log('warn', 'camoufox launch attempt failed', {
@@ -1094,16 +1148,56 @@ async function launchBrowserInstance() {
         error: err.message,
         proxySession: launchProxy?.sessionId || null,
       });
-      await candidateBrowser?.close().catch(() => {});
-      if (localVirtualDisplay) localVirtualDisplay.kill();
+      if (candidateBrowser) {
+        await discardBrowserLaunchCandidate({
+          browser: candidateBrowser,
+          virtualDisplay: localVirtualDisplay,
+          pid: candidateBrowser.process?.()?.pid ?? null,
+        }, launchToken);
+      } else {
+        localVirtualDisplay?.kill();
+      }
+      if (!launchToken.active) throw err;
     }
   }
 
   throw lastError || new Error('Failed to launch a usable browser');
 }
 
+const browserLaunchCoordinator = new BrowserLaunchCoordinator({
+  launch: launchBrowserInstance,
+  publish: async (candidate) => {
+    virtualDisplay = candidate.virtualDisplay;
+    browserLaunchProxy = candidate.proxy;
+    _lastBrowserPid = candidate.pid;
+    browser = candidate.browser;
+    _lastBrowserRestartAt = Date.now();
+    attachBrowserCleanup(browser, candidate.virtualDisplay, candidate.proxy);
+    pluginEvents.emit('browser:launched', { browser, display: candidate.display });
+
+    log('info', 'camoufox launched', {
+      attempt: candidate.attempt,
+      maxAttempts: candidate.maxAttempts,
+      virtualDisplay: candidate.useVirtualDisplay,
+      proxyMode: proxyPool?.mode || null,
+      proxyServer: candidate.proxy?.server || null,
+      proxySession: candidate.proxy?.sessionId || null,
+    });
+    return browser;
+  },
+  discard: discardBrowserLaunchCandidate,
+  timeoutMs: () => proxyPool?.launchTimeoutMs ?? 60000,
+  timeoutError: (launchTimeoutMs) => new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`),
+  onDiscardError: (err, _candidate, token) => {
+    log('warn', 'stale browser launch cleanup threw', { generation: token.generation, error: err.message });
+  },
+});
+
 async function ensureBrowser() {
   clearBrowserIdleTimer();
+  // A close uses broad survivor cleanup for the currently published browser.
+  // Do not let a replacement launch appear until that cleanup is finished.
+  if (_browserClosePromise) await _browserClosePromise;
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
@@ -1113,13 +1207,7 @@ async function ensureBrowser() {
     await closeBrowserFully('browser_disconnected');
   }
   if (browser) return browser;
-  if (browserLaunchPromise) return browserLaunchPromise;
-  const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
-  browserLaunchPromise = Promise.race([
-    launchBrowserInstance(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
-  ]).finally(() => { browserLaunchPromise = null; });
-  return browserLaunchPromise;
+  return browserLaunchCoordinator.ensure();
 }
 
 // Helper to normalize userId to string (JSON body may parse as number)
