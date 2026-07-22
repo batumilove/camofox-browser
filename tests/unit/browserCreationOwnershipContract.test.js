@@ -31,6 +31,18 @@ describe('browser creation ownership source contract', () => {
     expect(source).toContain('Always observe the raw settlement');
   });
 
+  test('managed removal paths transfer failed closes to owned cleanup', () => {
+    const server = read('server.js');
+    expect(server).toContain("cleanup: page => closeOwnedPage(page, 'tab_creation_abort', effectiveSession)");
+    expect(server).toContain("await closeOwnedPage(found.tabState.page, 'tab_delete', session)");
+    expect(server).toContain("await closeOwnedPage(tabState.page, 'tab_group_delete', session)");
+    expect(server).toContain("void closeOwnedPage(tabState.page, 'tab_inactivity_reaper', session)");
+    expect(server).toContain("cleanupLatePage: page => closeOwnedPage(page, 'late_page_recovery')");
+    expect(server).toContain('return Boolean(cleaned || orphanPageCleanup.owns(page))');
+    expect(server).toContain('const ownerEpoch = session?.browserGeneration ?? null');
+    expect(server).not.toContain('ownerEpoch: browserGeneration');
+  });
+
   test('launch publication is generation gated and timeouts invalidate ownership', () => {
     const source = read('server.js');
     expect(source).toContain('assertBrowserLaunchPublishable(launchSlot)');

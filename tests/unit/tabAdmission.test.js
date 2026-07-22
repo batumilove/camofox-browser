@@ -608,33 +608,108 @@ describe('bounded orphan cleanup', () => {
   test('deduplicates cleanup while a page close is already in flight', async () => {
     const gate = deferred();
     const closePage = jest.fn(() => gate.promise);
-    const tracker = new OrphanPageCleanup({ closePage, maxAttempts: 2, onEscalate: jest.fn() });
-    const session = {};
+    const session = { browserGeneration: 'browser-1' };
+    const onEscalate = jest.fn(async () => ({ terminated: true, ownerEpoch: 'browser-1' }));
+    const tracker = new OrphanPageCleanup({ closePage, maxAttempts: 2, onEscalate });
     const page = { isClosed: () => false };
 
     const first = tracker.cleanup(session, page, 'test');
     await flush();
-    await expect(tracker.cleanup(session, page, 'duplicate')).resolves.toBe(false);
+    const duplicate = tracker.cleanup(session, page, 'duplicate');
+    await flush();
     expect(closePage).toHaveBeenCalledTimes(1);
     gate.resolve();
-    await expect(first).resolves.toBe(false);
+    await expect(duplicate).resolves.toBe(true);
+    await expect(first).resolves.toBe(true);
+    expect(closePage).toHaveBeenCalledTimes(2);
+    expect(onEscalate).toHaveBeenCalledTimes(1);
+    expect(tracker.owns(page)).toBe(false);
   });
 
-  test('escalates after repeated bounded cleanup failures', async () => {
-    const onEscalate = jest.fn(async () => {});
-    const tracker = new OrphanPageCleanup({
-      closePage: jest.fn(async () => {}),
-      maxAttempts: 2,
-      onEscalate,
-    });
-    const session = { id: 'owner' };
-    const page = { isClosed: () => false };
+  test('retains strong ownership and self-retries a failed escalation', async () => {
+    jest.useFakeTimers();
+    try {
+      const session = { browserGeneration: 'browser-1' };
+      const onEscalate = jest
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const tracker = new OrphanPageCleanup({
+        closePage: jest.fn(async () => false),
+        maxAttempts: 1,
+        retryDelayMs: 10,
+        onEscalate,
+      });
+      const page = { isClosed: () => false };
 
-    await expect(tracker.cleanup(session, page, 'first')).resolves.toBe(false);
-    expect(onEscalate).not.toHaveBeenCalled();
-    await expect(tracker.cleanup(session, page, 'second')).resolves.toBe(false);
-    expect(onEscalate).toHaveBeenCalledTimes(1);
-    expect(onEscalate).toHaveBeenCalledWith(session, page, 'second', 2);
+      await expect(tracker.cleanup(session, page, 'first')).resolves.toBe(false);
+      expect(tracker.owns(page)).toBe(true);
+      expect(onEscalate).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(10);
+      await flush();
+      expect(onEscalate).toHaveBeenCalledTimes(2);
+      expect(tracker.owns(page)).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('bounds a hanging escalation and self-retries with a fresh attempt', async () => {
+    jest.useFakeTimers();
+    try {
+      const session = { browserGeneration: 'browser-1' };
+      const onEscalate = jest
+        .fn()
+        .mockImplementationOnce(() => new Promise(() => {}))
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const tracker = new OrphanPageCleanup({
+        closePage: jest.fn(async () => false),
+        maxAttempts: 1,
+        retryDelayMs: 10,
+        escalationTimeoutMs: 10,
+        onEscalate,
+      });
+      const page = { isClosed: () => false };
+
+      const cleanup = tracker.cleanup(session, page, 'hanging_escalation');
+      await jest.advanceTimersByTimeAsync(10);
+      await expect(cleanup).resolves.toBe(false);
+      expect(tracker.owns(page)).toBe(true);
+
+      await jest.advanceTimersByTimeAsync(10);
+      await flush();
+      expect(onEscalate).toHaveBeenCalledTimes(2);
+      expect(tracker.owns(page)).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('rejects closing-state and mismatched-epoch proof as termination', async () => {
+    jest.useFakeTimers();
+    try {
+      const session = { browserGeneration: 'browser-1', _closing: true };
+      const onEscalate = jest
+        .fn()
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-2' })
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const tracker = new OrphanPageCleanup({
+        closePage: jest.fn(async () => false),
+        maxAttempts: 1,
+        retryDelayMs: 10,
+        onEscalate,
+      });
+      const page = { isClosed: () => false };
+
+      await expect(tracker.cleanup(session, page, 'mismatch')).resolves.toBe(false);
+      expect(tracker.owns(page)).toBe(true);
+      await jest.advanceTimersByTimeAsync(10);
+      await flush();
+      expect(tracker.owns(page)).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -652,7 +727,7 @@ describe('bounded page cleanup', () => {
       const cleanup = closePageWithin(page, { timeoutMs: 100, onTimeout });
 
       await jest.advanceTimersByTimeAsync(100);
-      await expect(cleanup).resolves.toBeUndefined();
+      await expect(cleanup).resolves.toBe(false);
       expect(onTimeout).toHaveBeenCalledTimes(1);
       expect(page.removeAllListeners).toHaveBeenCalledTimes(1);
     } finally {
@@ -772,27 +847,34 @@ describe('awaitAbortableResource', () => {
     jest.useFakeTimers();
     const cleanupGate = deferred();
     const work = deferred();
+    const registered = new Set();
     try {
       const abort = new AbortController();
       let settled = false;
+      const resource = { id: 'bounded-cleanup' };
       const result = withAbortableResource({
-        create: async () => ({ id: 'bounded-cleanup' }),
+        create: async () => resource,
         signal: abort.signal,
-        register: async () => {},
-        unregister: async () => {},
+        register: async value => registered.add(value),
+        unregister: async value => registered.delete(value),
         cleanup: async () => cleanupGate.promise,
         cleanupTimeoutMs: 50,
         operation: async () => work.promise,
       });
       result.catch(() => { settled = true; });
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(registered.has(resource)).toBe(true);
       abort.abort(new Error('request timed out'));
       await jest.advanceTimersByTimeAsync(50);
       expect(settled).toBe(true);
       await expect(result).rejects.toThrow('request timed out');
+      expect(registered.has(resource)).toBe(true);
+      cleanupGate.resolve(true);
+      await flush();
+      expect(registered.size).toBe(0);
     } finally {
-      cleanupGate.resolve();
+      cleanupGate.resolve(true);
       work.resolve();
       jest.useRealTimers();
     }

@@ -74,6 +74,55 @@ describe('bounded resource creation', () => {
     expect(calls).toEqual(['settle', 'operate:temporary', 'cleanup:temporary']);
   });
 
+  test('caller abort interrupts an adopted operation and starts cleanup', async () => {
+    const controller = new AbortController();
+    const operation = deferred();
+    const cleanup = jest.fn(async () => {});
+    const resource = { id: 'adopted-page' };
+    const running = withTemporaryResource({
+      target: { newPage: async () => resource },
+      method: 'newPage',
+      signals: [controller.signal],
+      timeoutMs: 50,
+      cleanupTimeoutMs: 50,
+      cleanup,
+    }, () => operation.promise);
+    await flush();
+    const reason = new Error('client disconnected');
+    controller.abort(reason);
+    await expect(running).rejects.toBe(reason);
+    expect(cleanup).toHaveBeenCalledWith(resource);
+    operation.resolve('late-success');
+    await flush();
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  test('never-settling cleanup is bounded after operation abort', async () => {
+    jest.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const operation = deferred();
+      const cleanup = jest.fn(() => new Promise(() => {}));
+      const running = withTemporaryResource({
+        target: { newPage: async () => ({ id: 'stuck-cleanup' }) },
+        method: 'newPage',
+        signals: [controller.signal],
+        timeoutMs: 25,
+        cleanupTimeoutMs: 25,
+        cleanup,
+      }, () => operation.promise);
+      await flush();
+      const reason = new Error('client disconnected');
+      controller.abort(reason);
+      const rejected = expect(running).rejects.toBe(reason);
+      await jest.advanceTimersByTimeAsync(25);
+      await rejected;
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('caller abort rejects promptly and late settlement is still disposed', async () => {
     const raw = deferred();
     const controller = new AbortController();

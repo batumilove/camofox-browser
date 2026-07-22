@@ -317,6 +317,22 @@ describe('persistence plugin', () => {
     });
   });
 
+  test.each([
+    [409, 'session_reset_in_progress'],
+    [503, 'session_reset_incomplete'],
+  ])('DELETE storage_state preserves lifecycle status %i', async (statusCode, code) => {
+    ctx.resetSession.mockRejectedValueOnce(Object.assign(new Error(code), { statusCode, code }));
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const call = mockApp.delete.mock.calls.find(c => c[0] === '/sessions/:userId/storage_state');
+    const handler = call.at(-1);
+    const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
+
+    await handler({ params: { userId: 'blocked-user' } }, res);
+
+    expect(res.status).toHaveBeenCalledWith(statusCode);
+    expect(res.json).toHaveBeenCalledWith({ error: code, code });
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;

@@ -675,10 +675,10 @@ async function withUserLimit(userId, operation) {
 }
 
 async function safePageClose(page) {
-  await closePageWithin(page, {
+  return await closePageWithin(page, {
     timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
     onTimeout: (error) => {
-      log('warn', 'page close timed out or failed; leaving page for orphan reaper', { error: error.message });
+      log('warn', 'page close timed out or failed; transferring page to orphan cleanup', { error: error.message });
     },
   });
 }
@@ -687,21 +687,74 @@ const orphanPageCleanup = new OrphanPageCleanup({
   closePage: safePageClose,
   maxAttempts: 2,
   onEscalate: async (session, page, reason, attempts) => {
-    const owner = Array.from(sessions.entries()).find(([, candidate]) => candidate === session);
-    if (!owner || session._closing) return;
-    const [userId] = owner;
+    const ownerEpoch = session?.browserGeneration ?? null;
+    if (session?._closing && session._closePromise) {
+      await Promise.resolve(session._closePromise).catch(() => {});
+      if (page?.isClosed?.()) return { terminated: true, ownerEpoch };
+    }
+    const owner = session
+      ? Array.from(sessions.entries()).find(([, candidate]) => candidate === session)
+      : null;
+    const userId = owner?.[0] || null;
     log('warn', 'orphan page cleanup escalating to session teardown', {
       userId,
       reason,
       attempts,
       url: safePageUrl(page),
     });
-    await destroySession(userId, {
-      reason: 'orphan_cleanup_escalation',
-      expectedSession: session,
-    });
+    try {
+      if (owner) {
+        await destroySession(userId, {
+          reason: 'orphan_cleanup_escalation',
+          expectedSession: session,
+        });
+      } else if (session) {
+        await closeSession('orphan-superseded', session, {
+          reason: 'orphan_cleanup_escalation_superseded',
+          clearDownloads: true,
+          clearLocks: true,
+        });
+      }
+    } catch (error) {
+      log('error', 'orphan page session teardown failed; escalating browser teardown', {
+        userId,
+        reason,
+        error: error.message,
+      });
+    }
+    if (page?.isClosed?.()) return { terminated: true, ownerEpoch };
+    if (browser?._camofoxGeneration === ownerEpoch) {
+      return await closeBrowserFully(`orphan_page:${reason}`);
+    }
+    return { terminated: false, ownerEpoch };
   },
 });
+
+function findSessionForPage(page, preferredSession = null) {
+  let pageContext = null;
+  try { pageContext = page?.context?.(); } catch { /* dead page/context */ }
+  if (preferredSession && (!pageContext || preferredSession.context === pageContext)) return preferredSession;
+  for (const session of sessions.values()) {
+    if (session?.context === pageContext) return session;
+  }
+  return null;
+}
+
+async function closeOwnedPage(page, reason = 'managed_page_cleanup', preferredSession = null) {
+  const closed = await safePageClose(page);
+  if (closed || page?.isClosed?.()) return true;
+  const owner = findSessionForPage(page, preferredSession);
+  if (owner) {
+    const cleaned = await orphanPageCleanup.cleanup(owner, page, reason);
+    return Boolean(cleaned || orphanPageCleanup.owns(page));
+  }
+  log('error', 'unowned resident page survived bounded cleanup; escalating browser teardown', {
+    reason,
+    url: safePageUrl(page),
+  });
+  const proof = await closeBrowserFully(`unowned_page:${reason}`);
+  return Boolean(proof?.terminated || page?.isClosed?.());
+}
 
 const sessionCreationCoordinator = new SessionCreationCoordinator({
   maxInflight: MAX_SESSIONS,
@@ -1936,7 +1989,7 @@ async function createPageWithRecoveryForUser(userId, session, {
       deadlineMs: NEW_PAGE_TIMEOUT_MS + PAGE_CLOSE_TIMEOUT_MS,
       label,
     }),
-    cleanupLatePage: safePageClose,
+    cleanupLatePage: page => closeOwnedPage(page, 'late_page_recovery'),
     signal,
   });
 }
@@ -1966,7 +2019,7 @@ async function withTemporarySessionPage(userId, session, { signal, label = 'temp
           });
         }
       },
-      cleanup: safePageClose,
+      cleanup: page => closeOwnedPage(page, label, session),
     }, operation);
   } finally {
     capacityLease();
@@ -2006,11 +2059,15 @@ async function createUnregisteredManagedPage(userId, initialSession, { trace = f
     createdLease = null;
     return { session: effectiveSession, page: created.page };
   } catch (error) {
-    if (createdPage && createdLease) {
-      await closeLeasedPage(effectiveSession, createdPage, createdLease);
-      createdLease = null;
-    } else if (createdPage) {
-      await safePageClose(createdPage);
+    if (createdPage) {
+      try {
+        await closeOwnedPage(createdPage, 'managed_page_creation_failed', effectiveSession);
+      } finally {
+        if (createdLease) {
+          releasePageLease(effectiveSession, createdLease);
+          createdLease = null;
+        }
+      }
     }
     throw error;
   } finally {
@@ -2186,7 +2243,7 @@ function destroyTab(session, tabId, reason, userId) {
     if (group.has(tabId)) {
       const tabState = group.get(tabId);
       log('warn', 'destroying stuck tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason: reason || 'unknown' });
-      safePageClose(tabState.page);
+      void closeOwnedPage(tabState.page, 'stuck_tab_destroy', session).catch(() => {});
       group.delete(tabId);
       if (group.size === 0) session.tabGroups.delete(listItemId);
       refreshActiveTabsGauge();
@@ -2421,7 +2478,7 @@ function attachPopupHandler(page, userId, sessionKey) {
       const key = normalizeUserId(userId);
       const currentSession = sessions.get(key);
       if (!currentSession || currentSession._closing) {
-        await safePageClose(popupPage);
+        await closeOwnedPage(popupPage, 'popup_owner_unavailable', currentSession);
         return;
       }
 
@@ -2436,12 +2493,12 @@ function attachPopupHandler(page, userId, sessionKey) {
           code: error.code || 'tab_admission_rejected',
           url: safePageUrl(popupPage),
         });
-        await safePageClose(popupPage);
+        await closeOwnedPage(popupPage, 'popup_owner_unavailable', currentSession);
         return;
       }
 
       if (sessions.get(key) !== currentSession || currentSession._closing) {
-        await safePageClose(popupPage);
+        await closeOwnedPage(popupPage, 'popup_owner_unavailable', currentSession);
         return;
       }
       const popupTabId = fly.makeTabId();
@@ -2457,7 +2514,7 @@ function attachPopupHandler(page, userId, sessionKey) {
       attachPopupHandler(popupPage, userId, sessionKey);
     })().catch((error) => {
       log('warn', 'popup adoption failed', { userId: normalizeUserId(userId), error: error.message });
-      safePageClose(popupPage).catch(() => {});
+      closeOwnedPage(popupPage, 'popup_adoption_failed').catch(() => {});
     });
   });
 }
@@ -2565,7 +2622,7 @@ async function camofoxPressureCleanup(options = {}) {
       if (lockState.active || lockState.queued > 0) continue;
       if (item.tabState.navigateAbort) item.tabState.navigateAbort.abort();
       await clearTabDownloads(item.tabState).catch(() => {});
-      await safePageClose(item.tabState.page);
+      await closeOwnedPage(item.tabState.page, 'sibling_session_cleanup', sessions.get(item.userId));
       item.group.delete(item.tabId);
       sessionTabCounts.set(item.userId, Math.max(0, (sessionTabCounts.get(item.userId) || 0) - 1));
       const lock = tabLocks.get(item.tabId);
@@ -3635,11 +3692,13 @@ app.post('/tabs', async (req, res) => {
               refreshActiveTabsGauge();
             },
             cleanup: async (resource) => {
-              if (resource.lease) {
-                await closeLeasedPage(effectiveSession, resource.page, resource.lease);
-                resource.lease = null;
-              } else {
-                await safePageClose(resource.page);
+              try {
+                await closeOwnedPage(resource.page, 'tab_creation_abort', effectiveSession);
+              } finally {
+                if (resource.lease) {
+                  releasePageLease(effectiveSession, resource.lease);
+                  resource.lease = null;
+                }
               }
             },
             cleanupTimeoutMs: PAGE_CLOSE_TIMEOUT_MS + 100,
@@ -5930,7 +5989,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
     if (found) {
       if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
       await clearTabDownloads(found.tabState);
-      await safePageClose(found.tabState.page);
+      await closeOwnedPage(found.tabState.page, 'tab_delete', session);
       found.group.delete(req.params.tabId);
       { const _l = tabLocks.get(req.params.tabId); if (_l) _l.drain(); tabLocks.delete(req.params.tabId); refreshTabLockQueueDepth(); }
       if (found.group.size === 0) {
@@ -5992,7 +6051,7 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
     if (group) {
       for (const [tabId, tabState] of group) {
         await clearTabDownloads(tabState);
-        await safePageClose(tabState.page);
+        await closeOwnedPage(tabState.page, 'tab_group_delete', session);
         const lock = tabLocks.get(tabId);
         if (lock) {
           lock.drain();
@@ -6361,7 +6420,7 @@ setInterval(() => {
           if (idleMs >= TAB_INACTIVITY_MS) {
             tabsReapedTotal.inc();
             log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
-            safePageClose(tabState.page);
+            void closeOwnedPage(tabState.page, 'tab_inactivity_reaper', session).catch(() => {});
             group.delete(tabId);
             { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
             refreshTabLockQueueDepth();
@@ -6711,11 +6770,13 @@ app.post('/tabs/open', async (req, res) => {
               refreshActiveTabsGauge();
             },
             cleanup: async (resource) => {
-              if (resource.lease) {
-                await closeLeasedPage(effectiveSession, resource.page, resource.lease);
-                resource.lease = null;
-              } else {
-                await safePageClose(resource.page);
+              try {
+                await closeOwnedPage(resource.page, 'tab_creation_abort', effectiveSession);
+              } finally {
+                if (resource.lease) {
+                  releasePageLease(effectiveSession, resource.lease);
+                  resource.lease = null;
+                }
               }
             },
             cleanupTimeoutMs: PAGE_CLOSE_TIMEOUT_MS + 100,
@@ -7332,7 +7393,7 @@ app.post('/act', async (req, res) => {
         }
         
         case 'close': {
-          await safePageClose(tabState.page);
+          await closeOwnedPage(tabState.page, 'legacy_act_close', session);
           found.group.delete(targetId);
           { const _l = tabLocks.get(targetId); if (_l) _l.drain(); tabLocks.delete(targetId); }
           return { ok: true, targetId };

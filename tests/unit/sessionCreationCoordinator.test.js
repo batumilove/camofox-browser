@@ -81,7 +81,10 @@ describe('SessionCreationCoordinator', () => {
         disposeLate,
         onEscalate: jest.fn(async () => ({ terminated: true, ownerEpoch: 'browser-1' })),
       });
-      const creating = coordinator.getOrCreate('u1', async () => raw.promise);
+      const creating = coordinator.getOrCreate('u1', async ({ bindOwner }) => {
+        bindOwner('browser-1');
+        return raw.promise;
+      });
       creating.catch(() => {});
       await flush();
 
@@ -95,6 +98,97 @@ describe('SessionCreationCoordinator', () => {
       raw.resolve({ id: 'late' });
       await flush();
       expect(disposeLate).toHaveBeenCalledWith(expect.objectContaining({ id: 'late' }), expect.any(Object));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('mismatched termination proof retains ownership and self-retries escalation', async () => {
+    jest.useFakeTimers();
+    try {
+      const raw = deferred();
+      const onInternalError = jest.fn();
+      const onEscalate = jest
+        .fn()
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-other' })
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const coordinator = new SessionCreationCoordinator({
+        maxInflight: 1,
+        settleTimeoutMs: 25,
+        onEscalate,
+        onInternalError,
+      });
+      const creating = coordinator.getOrCreate('u1', async ({ bindOwner }) => {
+        bindOwner('browser-1');
+        return raw.promise;
+      });
+      creating.catch(() => {});
+      await flush();
+      const invalidation = coordinator.invalidate('u1', new Error('cancelled'));
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(invalidation).resolves.toBe(false);
+      expect(coordinator.snapshot().inflight).toBe(1);
+      await expect(coordinator.getOrCreate('u2', async () => ({ id: 'must-not-start' })))
+        .rejects.toMatchObject({ statusCode: 503, code: 'session_creation_capacity' });
+      expect(onInternalError).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({
+        phase: 'escalation_proof_mismatch',
+        ownerEpoch: 'browser-1',
+        proofOwnerEpoch: 'browser-other',
+      }));
+
+      await jest.advanceTimersByTimeAsync(50);
+      await flush();
+      expect(onEscalate).toHaveBeenCalledTimes(2);
+      expect(coordinator.snapshot().inflight).toBe(0);
+
+      raw.reject(new Error('owner finally terminated'));
+      await flush();
+      await jest.advanceTimersByTimeAsync(0);
+      await flush();
+      expect(coordinator.snapshot().inflight).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('times out a hanging escalation and self-retries to verified termination', async () => {
+    jest.useFakeTimers();
+    try {
+      const raw = deferred();
+      let firstSignal;
+      const onEscalate = jest
+        .fn()
+        .mockImplementationOnce((_entry, _reason, { signal }) => {
+          firstSignal = signal;
+          return new Promise(() => {});
+        })
+        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const coordinator = new SessionCreationCoordinator({
+        maxInflight: 1,
+        settleTimeoutMs: 10,
+        escalationTimeoutMs: 10,
+        onEscalate,
+      });
+      const creating = coordinator.getOrCreate('u1', async ({ bindOwner }) => {
+        bindOwner('browser-1');
+        return raw.promise;
+      });
+      creating.catch(() => {});
+      await flush();
+
+      const invalidation = coordinator.invalidate('u1', new Error('cancelled'));
+      await jest.advanceTimersByTimeAsync(20);
+      await expect(invalidation).resolves.toBe(false);
+      expect(firstSignal.aborted).toBe(true);
+      expect(coordinator.snapshot().inflight).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(20);
+      await flush();
+      expect(onEscalate).toHaveBeenCalledTimes(2);
+      expect(coordinator.snapshot().inflight).toBe(0);
+
+      raw.reject(new Error('late owner settlement'));
+      await flush();
     } finally {
       jest.useRealTimers();
     }

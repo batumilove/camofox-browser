@@ -50,9 +50,9 @@ describe('Navigate abort on tab deletion', () => {
     );
     expect(deleteSection).toContain('navigateAbort');
     expect(deleteSection).toContain('.abort()');
-    // abort() must come BEFORE safePageClose
+    // abort() must come BEFORE owned page cleanup
     const abortIdx = deleteSection.indexOf('.abort()');
-    const closeIdx = deleteSection.indexOf('safePageClose');
+    const closeIdx = deleteSection.indexOf('closeOwnedPage');
     expect(abortIdx).toBeLessThan(closeIdx);
   });
 

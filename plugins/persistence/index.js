@@ -250,7 +250,8 @@ export async function register(app, ctx, pluginConfig = {}) {
       res.json({ ok: true, userId, clearedLive, removedPersisted });
     } catch (err) {
       log('error', 'storage state reset failed', { reqId: req.reqId, userId, error: err.message });
-      res.status(500).json({ error: ctx.safeError(err) });
+      const status = err?.statusCode === 409 || err?.statusCode === 503 ? err.statusCode : 500;
+      res.status(status).json({ error: ctx.safeError(err), code: err?.code || undefined });
     } finally {
       resettingUsers.delete(userId);
     }
