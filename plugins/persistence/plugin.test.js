@@ -25,6 +25,11 @@ describe('persistence plugin', () => {
         return true;
       }),
     };
+    ctx.resetSession = jest.fn(async (userId, { reason, whileBlocked } = {}) => {
+      const hadLive = await ctx.destroySession(userId, { reason });
+      await whileBlocked?.();
+      return { hadLive, hadCreation: false };
+    });
   });
 
   afterEach(async () => {

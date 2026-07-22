@@ -179,6 +179,48 @@ export async function register(app, ctx, pluginConfig = {}) {
     activeSessions.clear();
   });
 
+  /**
+   * @openapi
+   * /sessions/{userId}/storage_state:
+   *   delete:
+   *     tags: [Sessions]
+   *     summary: Reset persisted and live session storage
+   *     description: Atomically blocks replacement session publication, closes live state, waits for checkpoint completion, and removes persisted storage. Idempotent when no state exists.
+   *     security:
+   *       - BearerAuth: []
+   *     parameters:
+   *       - name: userId
+   *         in: path
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Storage state reset completed.
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 ok:
+   *                   type: boolean
+   *                 clearedLive:
+   *                   type: boolean
+   *                 removedPersisted:
+   *                   type: boolean
+   *       409:
+   *         description: A reset for this user is already in progress.
+   *         content:
+   *           application/json:
+   *             schema:
+   *               $ref: '#/components/schemas/Error'
+   *       503:
+   *         description: Session lifecycle capacity is temporarily exhausted or teardown could not be verified.
+   *         content:
+   *           application/json:
+   *             schema:
+   *               $ref: '#/components/schemas/Error'
+   */
   app.delete('/sessions/:userId/storage_state', ctx.auth(), async (req, res) => {
     const userId = ctx.normalizeUserId(req.params.userId);
     if (resettingUsers.has(userId)) {
@@ -187,12 +229,17 @@ export async function register(app, ctx, pluginConfig = {}) {
 
     resettingUsers.add(userId);
     try {
-      const clearedLive = await ctx.destroySession(userId, { reason: 'storage_reset' });
-      await checkpointPromises.get(userId)?.catch(() => {});
-
       const { storageStatePath, metaPath } = getUserPersistencePaths(profileDir, userId);
-      const removedPersisted = await removeIfExists(storageStatePath);
-      await removeIfExists(metaPath);
+      let removedPersisted = false;
+      const reset = await ctx.resetSession(userId, {
+        reason: 'storage_reset',
+        whileBlocked: async () => {
+          await checkpointPromises.get(userId)?.catch(() => {});
+          removedPersisted = await removeIfExists(storageStatePath);
+          await removeIfExists(metaPath);
+        },
+      });
+      const clearedLive = reset.hadLive || reset.hadCreation;
 
       log('info', 'session storage state reset', {
         reqId: req.reqId,

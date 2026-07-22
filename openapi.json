@@ -494,7 +494,7 @@
             }
           },
           "409": {
-            "description": "Cannot enable tracing on an existing session.",
+            "description": "Session reset is in progress, the session was superseded, or tracing cannot be enabled on an existing session.",
             "content": {
               "application/json": {
                 "schema": {
@@ -517,6 +517,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TabAdmissionError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session lifecycle or creation capacity is temporarily exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2424,7 +2434,7 @@
           "Sessions"
         ],
         "summary": "Destroy a user session",
-        "description": "Closes all tabs and cleans up state for the given userId.",
+        "description": "Closes all tabs and cleans up state for the given userId. The operation is idempotent and blocks replacement publication until teardown completes.",
         "parameters": [
           {
             "name": "userId",
@@ -2454,8 +2464,18 @@
               }
             }
           },
-          "404": {
-            "description": "Session not found.",
+          "409": {
+            "description": "A reset for this session is already in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session lifecycle capacity is temporarily exhausted or invalidated creation could not be terminated safely.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2561,6 +2581,16 @@
               }
             }
           },
+          "409": {
+            "description": "Session reset is in progress or the session was superseded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Tab admission limit, queue overflow, or creation timeout.",
             "headers": {
@@ -2574,6 +2604,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TabAdmissionError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session lifecycle or creation capacity is temporarily exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2894,6 +2934,73 @@
           },
           "404": {
             "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{userId}/storage_state": {
+      "delete": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Reset persisted and live session storage",
+        "description": "Atomically blocks replacement session publication, closes live state, waits for checkpoint completion, and removes persisted storage. Idempotent when no state exists.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Storage state reset completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "clearedLive": {
+                      "type": "boolean"
+                    },
+                    "removedPersisted": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A reset for this user is already in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session lifecycle capacity is temporarily exhausted or teardown could not be verified.",
             "content": {
               "application/json": {
                 "schema": {
