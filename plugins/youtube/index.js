@@ -9,8 +9,8 @@ import { detectYtDlp, hasYtDlp, ensureYtDlp, ytDlpTranscript, parseJson3, parseV
 import { classifyError } from '../../lib/request-utils.js';
 
 export async function register(app, ctx, pluginConfig = {}) {
-  const { log, config, sessions, ensureBrowser, getSession,
-          withUserLimit, createLeasedPage, closeLeasedPage, normalizeUserId,
+  const { log, config, ensureBrowser, getSession,
+          withUserLimit, withTemporarySessionPage, cleanupEmptySession,
           validateUrl, safeError, buildProxyUrl, proxyPool,
           failuresTotal } = ctx;
 
@@ -58,10 +58,10 @@ export async function register(app, ctx, pluginConfig = {}) {
         // If yt-dlp returned an error result (e.g. no captions) or threw, try browser
         if (!result || result.status !== 'ok') {
           if (result) log('warn', 'yt-dlp returned error, falling back to browser', { reqId, status: result.status, code: result.code });
-          result = await browserTranscript(reqId, url, videoId, lang);
+          result = await browserTranscript(reqId, url, videoId, lang, req.resourceSignal);
         }
       } else {
-        result = await browserTranscript(reqId, url, videoId, lang);
+        result = await browserTranscript(reqId, url, videoId, lang, req.resourceSignal);
       }
 
       log('info', 'youtube transcript: done', { reqId, videoId, status: result.status, words: result.total_words });
@@ -74,13 +74,16 @@ export async function register(app, ctx, pluginConfig = {}) {
   });
 
   // Browser fallback -- play video, intercept timedtext network response
-  async function browserTranscript(reqId, url, videoId, lang) {
+  async function browserTranscript(reqId, url, videoId, lang, signal) {
     return await withUserLimit('__yt_transcript__', async () => {
       await ensureBrowser();
-      const session = await getSession('__yt_transcript__');
-      const { page, lease } = await createLeasedPage(session);
+      const session = await getSession('__yt_transcript__', { signal });
 
       try {
+        return await withTemporarySessionPage('__yt_transcript__', session, {
+          signal,
+          label: 'youtube_transcript',
+        }, async page => {
         await page.addInitScript(() => {
           const origPlay = HTMLMediaElement.prototype.play;
           HTMLMediaElement.prototype.play = function() { this.volume = 0; this.muted = true; return origPlay.call(this); };
@@ -183,23 +186,9 @@ export async function register(app, ctx, pluginConfig = {}) {
           language: lang, total_words: transcriptText.split(/\s+/).length,
           available_languages: meta.languages,
         };
+        });
       } finally {
-        await closeLeasedPage(session, page, lease);
-        // Clean up transcript session if no live pages remain
-        const ytKey = normalizeUserId('__yt_transcript__');
-        const ytSession = sessions.get(ytKey);
-        if (ytSession && !ytSession._closing) {
-          try {
-            const remainingPages = ytSession.context.pages();
-            if (remainingPages.length === 0 && !ytSession.pageLeases?.size) {
-              ytSession._closing = true;
-              ytSession.context.close().catch(() => {});
-              sessions.delete(ytKey);
-            }
-          } catch {
-            sessions.delete(ytKey);
-          }
-        }
+        await cleanupEmptySession('__yt_transcript__', session, 'youtube_transcript_complete');
       }
     });
   }

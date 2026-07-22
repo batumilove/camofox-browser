@@ -14,7 +14,7 @@ async function flush() {
 }
 
 describe('SessionCreationCoordinator', () => {
-  test('does not invoke a factory for a pre-aborted caller', async () => {
+  test('does not invoke a factory or retain state for a pre-aborted caller', async () => {
     const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50 });
     const controller = new AbortController();
     const reason = Object.assign(new Error('request expired'), { code: 'tab_admission_operation_timeout' });
@@ -23,17 +23,34 @@ describe('SessionCreationCoordinator', () => {
 
     await expect(coordinator.getOrCreate('u1', factory, { signal: controller.signal })).rejects.toBe(reason);
     expect(factory).not.toHaveBeenCalled();
-    expect(coordinator.snapshot()).toEqual({ inflight: 0, generations: { u1: 0 } });
+    expect(coordinator.snapshot()).toMatchObject({ inflight: 0, lifecycleKeys: 0, resetting: 0 });
+  });
+
+  test('successful creation remains current while settlement bookkeeping finishes', async () => {
+    const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50 });
+    let generation;
+    const session = await coordinator.getOrCreate('u1', async lifecycle => {
+      generation = lifecycle.generation;
+      return { id: 'live' };
+    });
+    expect(session.id).toBe('live');
+    expect(coordinator.isCurrent('u1', generation)).toBe(true);
+    await flush();
+    expect(coordinator.isCurrent('u1', generation)).toBe(true);
+  });
+
+  test('absent-user invalidation does not grow high-cardinality lifecycle state', async () => {
+    const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50 });
+    for (let index = 0; index < 10000; index++) {
+      await coordinator.invalidate(`attacker-${index}`);
+    }
+    expect(coordinator.snapshot()).toMatchObject({ inflight: 0, lifecycleKeys: 0, resetting: 0 });
   });
 
   test('keeps an invalidated raw factory accounted until it settles and disposes its late value', async () => {
     const raw = deferred();
     const disposeLate = jest.fn(async () => {});
-    const coordinator = new SessionCreationCoordinator({
-      maxInflight: 2,
-      settleTimeoutMs: 50,
-      disposeLate,
-    });
+    const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50, disposeLate });
     const creating = coordinator.getOrCreate('u1', async () => raw.promise);
     await flush();
     expect(coordinator.has('u1')).toBe(true);
@@ -53,16 +70,17 @@ describe('SessionCreationCoordinator', () => {
     expect(coordinator.snapshot().inflight).toBe(0);
   });
 
-  test('escalates after an invalidated factory misses its settlement deadline', async () => {
+  test('verified escalation retires capacity while retaining late disposal observation', async () => {
     jest.useFakeTimers();
     try {
-      const onEscalate = jest.fn(async () => {});
+      const raw = deferred();
+      const disposeLate = jest.fn(async () => {});
       const coordinator = new SessionCreationCoordinator({
         maxInflight: 1,
         settleTimeoutMs: 50,
-        onEscalate,
+        disposeLate,
+        onEscalate: jest.fn(async () => ({ terminated: true, ownerEpoch: 'browser-1' })),
       });
-      const raw = deferred();
       const creating = coordinator.getOrCreate('u1', async () => raw.promise);
       creating.catch(() => {});
       await flush();
@@ -70,13 +88,38 @@ describe('SessionCreationCoordinator', () => {
       const invalidation = coordinator.invalidate('u1', new Error('cancelled'));
       await jest.advanceTimersByTimeAsync(50);
       await expect(invalidation).resolves.toBe(false);
-      expect(onEscalate).toHaveBeenCalledTimes(1);
-      expect(coordinator.snapshot().inflight).toBe(1);
-
-      raw.reject(new Error('terminated'));
-      await jest.advanceTimersByTimeAsync(0);
-      await flush();
       expect(coordinator.snapshot().inflight).toBe(0);
+
+      const replacement = await coordinator.getOrCreate('u2', async () => ({ id: 'replacement' }));
+      expect(replacement.id).toBe('replacement');
+      raw.resolve({ id: 'late' });
+      await flush();
+      expect(disposeLate).toHaveBeenCalledWith(expect.objectContaining({ id: 'late' }), expect.any(Object));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('rejecting escalation is observed and reported without an unhandled rejection', async () => {
+    jest.useFakeTimers();
+    try {
+      const onInternalError = jest.fn();
+      const coordinator = new SessionCreationCoordinator({
+        maxInflight: 1,
+        settleTimeoutMs: 10,
+        onEscalate: async () => { throw new Error('teardown failed'); },
+        onInternalError,
+      });
+      const raw = deferred();
+      const creating = coordinator.getOrCreate('u1', async () => raw.promise);
+      creating.catch(() => {});
+      await flush();
+      const invalidation = coordinator.invalidate('u1', new Error('cancelled'));
+      await jest.advanceTimersByTimeAsync(10);
+      await expect(invalidation).resolves.toBe(false);
+      expect(onInternalError).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ key: 'u1' }));
+      raw.reject(new Error('terminated later'));
+      await flush();
     } finally {
       jest.useRealTimers();
     }
@@ -97,20 +140,46 @@ describe('SessionCreationCoordinator', () => {
     await expect(first).rejects.toBe(reason);
   });
 
-  test('coalesces callers and exposes an atomic generation assertion', async () => {
+  test('one aborted coalesced waiter does not invalidate another live waiter', async () => {
     const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50 });
     const gate = deferred();
-    const factory = jest.fn(async ({ assertCurrent }) => {
-      await gate.promise;
-      assertCurrent();
-      return { id: 'session' };
-    });
-    const first = coordinator.getOrCreate('u1', factory);
-    const second = coordinator.getOrCreate('u1', factory);
-    gate.resolve();
-
-    const [a, b] = await Promise.all([first, second]);
-    expect(a).toBe(b);
+    const factory = jest.fn(async () => gate.promise);
+    const controller = new AbortController();
+    const first = coordinator.getOrCreate('same', factory, { signal: controller.signal });
+    const second = coordinator.getOrCreate('same', factory);
+    const reason = new Error('caller one disconnected');
+    controller.abort(reason);
+    await expect(first).rejects.toBe(reason);
+    gate.resolve({ id: 'shared-session' });
+    await expect(second).resolves.toEqual({ id: 'shared-session' });
     expect(factory).toHaveBeenCalledTimes(1);
+  });
+
+  test('all aborted waiters invalidate shared creation and dispose a late result', async () => {
+    const raw = deferred();
+    const disposeLate = jest.fn(async () => {});
+    const coordinator = new SessionCreationCoordinator({ maxInflight: 2, settleTimeoutMs: 50, disposeLate });
+    const one = new AbortController();
+    const two = new AbortController();
+    const first = coordinator.getOrCreate('same', async () => raw.promise, { signal: one.signal });
+    const second = coordinator.getOrCreate('same', async () => raw.promise, { signal: two.signal });
+    one.abort(new Error('one gone'));
+    two.abort(new Error('two gone'));
+    await Promise.allSettled([first, second]);
+    raw.resolve({ id: 'late' });
+    await flush();
+    expect(disposeLate).toHaveBeenCalledTimes(1);
+  });
+
+  test('reset is a synchronous publication barrier and removes state after completion', async () => {
+    const coordinator = new SessionCreationCoordinator({ maxInflight: 2, maxResetBarriers: 1, settleTimeoutMs: 50 });
+    const gate = deferred();
+    const reset = coordinator.reset('u1', { whileBlocked: async () => gate.promise });
+    await flush();
+    await expect(coordinator.getOrCreate('u1', async () => ({ id: 'must-not-start' })))
+      .rejects.toMatchObject({ statusCode: 409, code: 'session_reset_in_progress' });
+    gate.resolve();
+    await reset;
+    expect(coordinator.snapshot()).toMatchObject({ inflight: 0, lifecycleKeys: 0, resetting: 0 });
   });
 });

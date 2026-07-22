@@ -16,7 +16,7 @@ const root = join(__dirname, '..');
 
 const spec = swaggerJsdoc({
   definition: swaggerDefinition,
-  apis: [join(root, 'server.js')],
+  apis: [join(root, 'server.js'), join(root, 'plugins', 'persistence', 'index.js')],
 });
 
 const out = join(root, 'openapi.json');

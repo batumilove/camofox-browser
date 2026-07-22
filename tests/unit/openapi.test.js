@@ -18,13 +18,15 @@ import { swaggerDefinition } from '../../lib/openapi.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(__dirname, '..', '..', 'server.js');
+const persistencePluginPath = join(__dirname, '..', '..', 'plugins', 'persistence', 'index.js');
 const serverSrc = readFileSync(serverPath, 'utf8');
+const persistencePluginSrc = readFileSync(persistencePluginPath, 'utf8');
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8'));
 
-// Build spec from JSDoc in server.js
+// Build spec from core and lifecycle-sensitive plugin routes
 const spec = swaggerJsdoc({
   definition: swaggerDefinition,
-  apis: [serverPath],
+  apis: [serverPath, persistencePluginPath],
 });
 
 /**
@@ -41,7 +43,10 @@ function parseServerRoutes(source) {
   return routes;
 }
 
-const serverRoutes = parseServerRoutes(serverSrc);
+const serverRoutes = new Set([
+  ...parseServerRoutes(serverSrc),
+  ...parseServerRoutes(persistencePluginSrc),
+]);
 
 describe('OpenAPI spec', () => {
   test('is valid OpenAPI 3.0.x shape', () => {
@@ -143,6 +148,20 @@ describe('OpenAPI spec', () => {
       expect(response).toBeDefined();
       expect(response.headers?.['Retry-After']).toBeDefined();
       expect(response.content?.['application/json']?.schema?.$ref).toBe('#/components/schemas/TabAdmissionError');
+    }
+  });
+
+  test('lifecycle-sensitive create and reset routes document 409 and 503', () => {
+    const operations = [
+      spec.paths['/tabs']?.post,
+      spec.paths['/tabs/open']?.post,
+      spec.paths['/sessions/{userId}']?.delete,
+      spec.paths['/sessions/{userId}/storage_state']?.delete,
+    ];
+    for (const operation of operations) {
+      expect(operation).toBeDefined();
+      expect(operation.responses?.['409']).toBeDefined();
+      expect(operation.responses?.['503']).toBeDefined();
     }
   });
 

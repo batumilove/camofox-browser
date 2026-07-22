@@ -213,6 +213,42 @@ describe('TabAdmissionController', () => {
       jest.useRealTimers();
     }
   });
+
+  test('removes an externally aborted queued request immediately', async () => {
+    const controller = new TabAdmissionController({ maxActive: 1, maxActivePerUser: 1, maxPending: 2 });
+    const active = deferred();
+    const first = controller.run('u1', () => active.promise);
+    const request = new AbortController();
+    const queued = controller.run('u2', async () => 'never', { signal: request.signal });
+    await flush();
+    const reason = Object.assign(new Error('client disconnected'), { code: 'request_disconnected' });
+    request.abort(reason);
+    await expect(queued).rejects.toBe(reason);
+    expect(controller.snapshot()).toMatchObject({ active: 1, pending: 0 });
+    active.resolve('done');
+    await first;
+  });
+
+  test('aborts active work when the external request disconnects', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 1,
+      abortGraceMs: 0,
+    });
+    const request = new AbortController();
+    let operationSignal;
+    const running = controller.run('u1', async signal => {
+      operationSignal = signal;
+      await new Promise(() => {});
+    }, { signal: request.signal });
+    await flush();
+    const reason = Object.assign(new Error('client disconnected'), { code: 'request_disconnected' });
+    request.abort(reason);
+    await expect(running).rejects.toBe(reason);
+    expect(operationSignal.aborted).toBe(true);
+    expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
+  });
 });
 
 describe('RawCreationRegistry', () => {

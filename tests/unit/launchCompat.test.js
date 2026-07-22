@@ -36,8 +36,8 @@ describe('launch compatibility source contract', () => {
 
   test('does not configure a fixed default browser context viewport', () => {
     const googleProbeOptions = sourceBetween(
-      'context = await candidateBrowser.newContext({',
-      'const page = await context.newPage();'
+      'ownerKey: `__launch_probe_${launchSlot.id}`',
+      "label: 'launch_google_probe'"
     );
     const sessionContextOptions = sourceBetween(
       'const contextOptions = {',
