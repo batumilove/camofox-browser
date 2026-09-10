@@ -43,7 +43,10 @@ import {
   TabAdmissionController,
   TabCapacityReservations,
   canReapEmptySession,
+  closePageWithin,
   detachSessionForClose,
+  releaseOnAbort,
+  replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
@@ -533,17 +536,10 @@ async function withUserLimit(userId, operation) {
 }
 
 async function safePageClose(page) {
-  if (!page || page.isClosed()) return;
-  try {
-    await Promise.race([
-      page.close({ runBeforeUnload: false }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), PAGE_CLOSE_TIMEOUT_MS)),
-    ]);
-  } catch (e) {
-    log('warn', 'page close timed out or failed, force-closing', { error: e.message });
-    try { await page.close({ runBeforeUnload: false }); } catch (_) {}
-    page.removeAllListeners();
-  }
+  await closePageWithin(page, {
+    timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
+    onFailure: (error) => log('warn', 'page close timed out or failed; cleanup abandoned', { error: error.message }),
+  });
 }
 
 // Detect host OS for fingerprint generation
@@ -2761,13 +2757,13 @@ app.post('/tabs', async (req, res) => {
         );
       }
 
-      const releaseCapacity = tabCapacity.reserve(normalizeUserId(userId));
+      const releaseCapacity = releaseOnAbort(signal, tabCapacity.reserve(normalizeUserId(userId)));
       try {
         const tabId = fly.makeTabId();
         const createAttempt = async (session) => {
           let group;
           let tabState;
-          const releasePendingCreation = reservePendingTabCreation(session);
+          const releasePendingCreation = releaseOnAbort(signal, reservePendingTabCreation(session));
           try {
             return await withAbortableResource({
             create: () => session.context.newPage(),
@@ -2805,6 +2801,7 @@ app.post('/tabs', async (req, res) => {
         };
 
         let session = await getSession(userId, { trace: !!trace });
+        if (signal.aborted) throw signal.reason;
         try {
           return await createAttempt(session);
         } catch (navErr) {
@@ -2814,11 +2811,14 @@ app.post('/tabs', async (req, res) => {
           });
           browserRestartsTotal.labels('proxy_retry').inc();
           const key = normalizeUserId(userId);
-          const oldSession = sessions.get(key);
-          if (oldSession) {
-            await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-          }
-          session = await getSession(userId, { trace: !!trace });
+          session = await replaceSessionAfterProxyFailure({
+            signal,
+            userKey: key,
+            failedSession: session,
+            closeSession,
+            closeOptions: { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true },
+            getSession: () => getSession(userId, { trace: !!trace }),
+          });
           return createAttempt(session);
         }
       } finally {

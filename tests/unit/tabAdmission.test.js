@@ -406,4 +406,23 @@ describe('bounded timeout cleanup helpers', () => {
     expect(closeSession).not.toHaveBeenCalled();
     expect(getSession).not.toHaveBeenCalled();
   });
+
+  test('proxy retry does not obtain a replacement if abort arrives while closing the failed session', async () => {
+    const controller = new AbortController();
+    const closeGate = deferred();
+    const closeSession = jest.fn(() => closeGate.promise);
+    const getSession = jest.fn();
+    const result = replaceSessionAfterProxyFailure({
+      signal: controller.signal,
+      userKey: 'user',
+      failedSession: {},
+      closeSession,
+      getSession,
+    });
+
+    controller.abort(new Error('timed out during close'));
+    closeGate.resolve();
+    await expect(result).rejects.toThrow('timed out during close');
+    expect(getSession).not.toHaveBeenCalled();
+  });
 });
