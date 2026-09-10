@@ -9,6 +9,7 @@ import {
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
+  settleAllConcurrently,
   settleWithin,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
@@ -366,6 +367,29 @@ describe('awaitAbortableResource', () => {
 });
 
 describe('bounded timeout cleanup helpers', () => {
+  test('starts every session teardown without serially consuming the global shutdown budget', async () => {
+    const first = deferred();
+    const second = deferred();
+    const started = [];
+    const work = settleAllConcurrently([
+      ['first', first],
+      ['second', second],
+    ], async ([name, gate]) => {
+      started.push(name);
+      await gate.promise;
+      return name;
+    });
+
+    await flush();
+    expect(started).toEqual(['first', 'second']);
+    first.resolve();
+    second.resolve();
+    await expect(work).resolves.toEqual([
+      expect.objectContaining({ status: 'fulfilled', value: 'first' }),
+      expect.objectContaining({ status: 'fulfilled', value: 'second' }),
+    ]);
+  });
+
   test('coalesces concurrent teardown of the same session', async () => {
     const session = {};
     const gate = deferred();

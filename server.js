@@ -50,6 +50,7 @@ import {
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
+  settleAllConcurrently,
   settleWithin,
   withAbortableResource,
 } from './lib/tab-admission.js';
@@ -1314,9 +1315,9 @@ function closeSession(userId, session, {
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
   const openSessions = Array.from(sessions.entries());
-  for (const [userId, session] of openSessions) {
-    await closeSession(userId, session, { reason, clearDownloads, clearLocks });
-  }
+  await settleAllConcurrently(openSessions, ([userId, session]) => (
+    closeSession(userId, session, { reason, clearDownloads, clearLocks })
+  ));
 }
 
 async function getSession(userId, { trace = false } = {}) {

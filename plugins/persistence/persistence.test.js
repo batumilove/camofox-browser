@@ -114,4 +114,42 @@ describe('profile persistence helpers', () => {
     const leftovers = (await fs.readdir(userDir)).filter((name) => name.includes('.tmp-'));
     expect(leftovers).toEqual([]);
   });
+
+  test('revalidates generation immediately before synchronous publication', async () => {
+    const original = {
+      cookies: [{ name: 'current', value: 'v1', domain: '.example.com', path: '/' }],
+      origins: [],
+    };
+    const stale = {
+      cookies: [{ name: 'stale', value: 'v0', domain: '.example.com', path: '/' }],
+      origins: [],
+    };
+    const writeState = (state) => ({
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify(state));
+      }),
+    });
+
+    await persistStorageState({
+      profileDir: tmpDir,
+      userId: 'generation-user',
+      context: writeState(original),
+    });
+
+    let generation = 1;
+    const result = await persistStorageState({
+      profileDir: tmpDir,
+      userId: 'generation-user',
+      context: writeState(stale),
+      shouldPublish: () => generation === 1,
+      beforePublish: () => { generation = 2; },
+    });
+
+    expect(result).toEqual({ persisted: false, reason: 'superseded' });
+    const { userDir, storageStatePath } = getUserPersistencePaths(tmpDir, 'generation-user');
+    const published = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(published.cookies[0].name).toBe('current');
+    const leftovers = (await fs.readdir(userDir)).filter((name) => name.includes('.tmp-'));
+    expect(leftovers).toEqual([]);
+  });
 });
