@@ -83,6 +83,26 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('shutdown relies on session teardown instead of starting a duplicate checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const mockContext = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'shutdown-user', context: mockContext });
+    await events.emitAsync('server:shutdown', { signal: 'SIGTERM' });
+    expect(mockContext.storageState).not.toHaveBeenCalled();
+
+    await events.emitAsync('session:destroying', {
+      userId: 'shutdown-user',
+      context: mockContext,
+      reason: 'shutdown:SIGTERM',
+    });
+    expect(mockContext.storageState).toHaveBeenCalledTimes(1);
+  });
+
   test('late destruction of session A neither checkpoints nor untracks replacement session B', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
     let releaseCheckpoint, markCheckpointStarted;
@@ -92,12 +112,12 @@ describe('persistence plugin', () => {
       storageState: jest.fn(async ({ path: p }) => {
         markCheckpointStarted();
         await checkpointGate;
-        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'stale-a' }], origins: [] }));
       }),
     };
     const contextB = {
       storageState: jest.fn(async ({ path: p }) => {
-        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'current-b' }], origins: [] }));
       }),
     };
 
@@ -111,17 +131,30 @@ describe('persistence plugin', () => {
     expect(contextA.storageState).toHaveBeenCalledTimes(1);
 
     await events.emitAsync('session:created', { userId: 'race-user', context: contextB });
-    releaseCheckpoint();
-    await destroyingA;
+    const checkpointB = events.emitAsync('session:cookies:import', { userId: 'race-user' });
+    try {
+      const outcome = await Promise.race([
+        checkpointB.then(() => 'completed'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 100)),
+      ]);
+      expect(outcome).toBe('blocked');
+      expect(contextB.storageState).not.toHaveBeenCalled();
+    } finally {
+      releaseCheckpoint();
+      await Promise.all([destroyingA, checkpointB]);
+    }
     await events.emitAsync('session:destroyed', {
       userId: 'race-user',
       context: contextA,
       reason: 'proxy_retry_rotate',
     });
-    await events.emitAsync('session:cookies:import', { userId: 'race-user' });
 
     expect(contextA.storageState).toHaveBeenCalledTimes(1);
     expect(contextB.storageState).toHaveBeenCalledTimes(1);
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'race-user');
+    const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(saved.cookies[0].name).toBe('current-b');
   });
 
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {

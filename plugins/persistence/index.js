@@ -48,17 +48,36 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // Track active sessions for checkpoint on close
   const activeSessions = new Map(); // userId -> context
+  const checkpointTails = new Map(); // userId -> latest serialized checkpoint
 
   /**
    * Checkpoint storage state to disk for a userId.
    */
   async function checkpoint(userId, context, reason) {
     if (!context) return;
-    const result = await persistStorageState({ profileDir, userId, context, logger });
-    if (result.persisted) {
-      log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+    const previous = checkpointTails.get(userId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+      if (activeSessions.get(userId) !== context) {
+        return { persisted: false, reason: 'superseded' };
+      }
+      const result = await persistStorageState({
+        profileDir,
+        userId,
+        context,
+        logger,
+        shouldPublish: () => activeSessions.get(userId) === context,
+      });
+      if (result.persisted) {
+        log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+      }
+      return result;
+    });
+    checkpointTails.set(userId, current);
+    try {
+      return await current;
+    } finally {
+      if (checkpointTails.get(userId) === current) checkpointTails.delete(userId);
     }
-    return result;
   }
 
   // --- Lifecycle hooks ---
@@ -112,11 +131,6 @@ export async function register(app, ctx, pluginConfig = {}) {
     if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
   });
 
-  // On shutdown: checkpoint all remaining sessions
-  events.on('server:shutdown', async () => {
-    for (const [userId, context] of activeSessions) {
-      await checkpoint(userId, context, 'shutdown').catch(() => {});
-    }
-    activeSessions.clear();
-  });
+  // Shutdown checkpointing is owned by session:destroying. A second
+  // server:shutdown path would race the same contexts and disk targets.
 }

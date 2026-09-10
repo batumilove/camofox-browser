@@ -44,11 +44,13 @@ import {
   TabCapacityReservations,
   canReapEmptySession,
   closePageWithin,
+  coalesceSessionClose,
   detachSessionForClose,
   releaseOnAbort,
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
+  settleWithin,
   withAbortableResource,
 } from './lib/tab-admission.js';
 
@@ -571,6 +573,7 @@ const tabAdmission = new TabAdmissionController({
   maxActive: TAB_ADMISSION_MAX_ACTIVE,
   maxActivePerUser: TAB_ADMISSION_MAX_ACTIVE_PER_USER,
   maxPending: TAB_ADMISSION_QUEUE_LIMIT,
+  maxAbandoned: TAB_ADMISSION_MAX_ACTIVE,
   waitTimeoutMs: requestTimeoutMs(),
   operationTimeoutMs: requestTimeoutMs(),
   retryAfterSeconds: 2,
@@ -580,6 +583,12 @@ const tabAdmission = new TabAdmissionController({
   },
   onRejected: () => tabAdmissionRejectedTotal.inc(),
   onTimeout: () => tabAdmissionTimeoutsTotal.inc(),
+  onAbandonedLimit: ({ abandoned }) => {
+    log('error', 'tab admission abandoned-operation limit reached; resetting browser generation', { abandoned });
+    void closeBrowserFully('tab_admission_abandoned_limit').catch((error) => {
+      log('error', 'browser generation reset after abandoned operations failed', { error: error.message });
+    });
+  },
 });
 
 async function withTabAdmission(userId, operation) {
@@ -1229,53 +1238,78 @@ function clearSessionLocks(session) {
   refreshTabLockQueueDepth();
 }
 
-async function closeSession(userId, session, {
+const SESSION_CLOSE_STEP_TIMEOUT_MS = 2000;
+
+function logLifecycleSettlement(eventName, result, fields) {
+  if (result.status === 'timeout') {
+    log('warn', `${eventName} timed out`, fields);
+  } else if (result.status === 'rejected') {
+    log('warn', `${eventName} failed`, { ...fields, error: result.reason?.message || String(result.reason) });
+  }
+}
+
+function closeSession(userId, session, {
   reason = 'session_closed',
   clearDownloads = true,
   clearLocks = true,
 } = {}) {
-  if (!session) return;
+  if (!session) return Promise.resolve();
 
-  const key = normalizeUserId(userId);
-  // Detach synchronously so a hung context.close() cannot leave an internal
-  // _closing session resident. Identity checking protects a newer session
-  // installed under the same user key from late teardown of the old one.
-  detachSessionForClose(sessions, key, session);
+  return coalesceSessionClose(session, async () => {
+    const key = normalizeUserId(userId);
+    // Detach synchronously so replacements never inherit stale teardown work.
+    detachSessionForClose(sessions, key, session);
 
-  // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
-  // (410) instead of messy "Target page closed" (500) errors.
-  if (clearLocks) {
-    clearSessionLocks(session);
-  }
-
-  if (clearDownloads) {
-    await clearSessionDownloads(session).catch(() => {});
-  }
-
-  await pluginEvents.emitAsync('session:destroying', {
-    userId: key,
-    reason,
-    session,
-    context: session.context,
-  });
-  if (session.tracePath) {
     try {
-      await session.context.tracing.stop({ path: session.tracePath });
-      log('info', 'tracing saved', { userId: key, path: session.tracePath });
-    } catch (err) {
-      log('warn', 'tracing.stop failed', { userId: key, error: err.message });
+      // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
+      // (410) instead of messy "Target page closed" (500) errors.
+      if (clearLocks) clearSessionLocks(session);
+
+      if (clearDownloads) {
+        const downloadResult = await settleWithin(
+          clearSessionDownloads(session),
+          SESSION_CLOSE_STEP_TIMEOUT_MS,
+        );
+        logLifecycleSettlement('session download cleanup', downloadResult, { userId: key, reason });
+      }
+
+      const destroyingResult = await settleWithin(pluginEvents.emitAsync('session:destroying', {
+        userId: key,
+        reason,
+        session,
+        context: session.context,
+      }), SESSION_CLOSE_STEP_TIMEOUT_MS);
+      logLifecycleSettlement('session:destroying', destroyingResult, { userId: key, reason });
+
+      if (session.tracePath) {
+        const traceResult = await settleWithin(
+          session.context.tracing.stop({ path: session.tracePath }),
+          SESSION_CLOSE_STEP_TIMEOUT_MS,
+        );
+        if (traceResult.status === 'fulfilled') {
+          log('info', 'tracing saved', { userId: key, path: session.tracePath });
+        } else {
+          logLifecycleSettlement('tracing.stop', traceResult, { userId: key, reason });
+        }
+      }
+    } finally {
+      // Context closure is independent of plugin checkpoint completion.
+      const closeResult = await settleWithin(
+        Promise.resolve().then(() => session.context.close()),
+        SESSION_CLOSE_STEP_TIMEOUT_MS,
+      );
+      logLifecycleSettlement('context.close', closeResult, { userId: key, reason });
+
+      const destroyedResult = await settleWithin(pluginEvents.emitAsync('session:destroyed', {
+        userId: key,
+        reason,
+        session,
+        context: session.context,
+      }), SESSION_CLOSE_STEP_TIMEOUT_MS);
+      logLifecycleSettlement('session:destroyed', destroyedResult, { userId: key, reason });
+      refreshActiveTabsGauge();
     }
-  }
-
-  await session.context.close().catch(() => {});
-  await pluginEvents.emitAsync('session:destroyed', {
-    userId: key,
-    reason,
-    session,
-    context: session.context,
   });
-
-  refreshActiveTabsGauge();
 }
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
@@ -6281,13 +6315,18 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log('info', 'shutting down', { signal });
-  pluginEvents.emit('server:shutdown', { signal });
 
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
     process.exit(1);
   }, 10000);
   forceTimeout.unref();
+
+  const shutdownHooks = await settleWithin(
+    pluginEvents.emitAsync('server:shutdown', { signal }),
+    SESSION_CLOSE_STEP_TIMEOUT_MS,
+  );
+  logLifecycleSettlement('server:shutdown', shutdownHooks, { signal });
 
   server.close();
   stopMemoryReporter();

@@ -5,9 +5,11 @@ import {
   awaitAbortableResource,
   canReapEmptySession,
   closePageWithin,
+  coalesceSessionClose,
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
+  settleWithin,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
 
@@ -304,6 +306,25 @@ describe('sendTabAdmissionError', () => {
 });
 
 describe('awaitAbortableResource', () => {
+  test('rejects promptly on abort and cleans a resource that settles later', async () => {
+    const resource = deferred();
+    const abort = new AbortController();
+    const close = jest.fn(async () => {});
+    const result = awaitAbortableResource(resource.promise, abort.signal, close);
+
+    abort.abort(new Error('request timed out'));
+    const outcome = await Promise.race([
+      result.then(() => 'resolved', (error) => error.message),
+      new Promise((resolve) => setTimeout(() => resolve('still-waiting'), 50)),
+    ]);
+    expect(outcome).toBe('request timed out');
+    expect(close).not.toHaveBeenCalled();
+
+    resource.resolve({ id: 'late-page' });
+    await new Promise(setImmediate);
+    expect(close).toHaveBeenCalledWith({ id: 'late-page' });
+  });
+
   test('closes a resource that resolves after its operation was aborted', async () => {
     const resource = deferred();
     const abort = new AbortController();
@@ -345,6 +366,32 @@ describe('awaitAbortableResource', () => {
 });
 
 describe('bounded timeout cleanup helpers', () => {
+  test('coalesces concurrent teardown of the same session', async () => {
+    const session = {};
+    const gate = deferred();
+    const teardown = jest.fn(() => gate.promise);
+
+    const first = coalesceSessionClose(session, teardown);
+    const second = coalesceSessionClose(session, teardown);
+    expect(first).toBe(second);
+    await flush();
+    expect(teardown).toHaveBeenCalledTimes(1);
+
+    gate.resolve('closed');
+    await expect(Promise.all([first, second])).resolves.toEqual(['closed', 'closed']);
+  });
+
+  test('returns from a hung lifecycle hook at its deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      const result = settleWithin(new Promise(() => {}), 25);
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(result).resolves.toEqual({ status: 'timeout' });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('a hung page close is attempted once and returns at the cleanup deadline', async () => {
     jest.useFakeTimers();
     try {
