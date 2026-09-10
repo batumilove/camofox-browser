@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
+  refreshOwnedProcessSnapshot,
   signalOwnedProcess,
   snapshotOwnedProcessTreesByExecutable,
   snapshotOwnedBrowserProcesses,
@@ -141,9 +142,11 @@ test('only captured descendants survive reparenting; unrelated PID 1 browsers do
   const snapshot = snapshotOwnedBrowserProcesses(100, root);
 
   fs.writeFileSync(path.join(root, '101', 'status'), 'Name:\ttest\nPPid:\t1\n');
+  proc(root, 102, 101, 'GeckoChildProcess\0-contentproc', '30');
 
   expect(snapshot.map(p => p.pid)).toEqual([101]);
   expect(survivingOwnedBrowserProcesses(snapshot, root).map(p => p.pid)).toEqual([101]);
+  expect(refreshOwnedProcessSnapshot(snapshot, root).map(p => p.pid)).toEqual([101, 102]);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -202,5 +205,9 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(source).toContain('VirtualDisplay: DefaultVirtualDisplay');
   expect(source).toMatch(/candidateBrowser\.close = async[\s\S]*?finally/);
   expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*server\.close/);
-  expect(source).toMatch(/if \(tabAdmission\.closed\)[\s\S]*createTabAdmissionShutdownError\([\s\S]*virtualDisplay = localVirtualDisplay/);
+  expect(source).toMatch(/if \(tabAdmission\.closed \|\| launchGeneration !== browserLaunchGeneration\)[\s\S]*?virtualDisplay = localVirtualDisplay/);
+  expect(source).toMatch(/const tracked = launch\.finally[\s\S]*?browserLaunchPromise = tracked/);
+  expect(source).toMatch(/return Promise\.race\(\[\s*browserLaunchPromise,[\s\S]*?Browser launch timeout/);
+  expect(source).toMatch(/app\.post\('\/stop'[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?await invalidatedLaunch\?\.catch[\s\S]*?closeBrowserFully\('admin_stop'\)/);
+  expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?Promise\.all\(\[[\s\S]*?invalidatedLaunch\?\.catch/);
 });

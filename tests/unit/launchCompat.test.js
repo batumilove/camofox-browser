@@ -51,7 +51,7 @@ describe('launch compatibility source contract', () => {
 
   test('uses a real desktop window only when interactive desktop mode is explicit', () => {
     const launch = sourceBetween(
-      'async function launchBrowserInstance()',
+      'async function launchBrowserInstance(launchGeneration)',
       'async function ensureBrowser()'
     );
 

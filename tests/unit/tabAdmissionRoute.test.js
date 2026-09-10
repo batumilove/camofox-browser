@@ -61,7 +61,7 @@ describe('POST /tabs admission recovery', () => {
       code: 'tab_admission_shutting_down',
       retryAfter: 7,
     });
-    expect(serverSrc).toMatch(/if \(tabAdmission\.closed\)[\s\S]*throw createTabAdmissionShutdownError\(CONFIG\.tabAdmissionRetryAfter\)/);
+    expect(serverSrc).toMatch(/if \(tabAdmission\.closed \|\| launchGeneration !== browserLaunchGeneration\)[\s\S]*throw createTabAdmissionShutdownError\(CONFIG\.tabAdmissionRetryAfter\)/);
   });
 
   test('waiting requests stay bounded globally and per user', async () => {

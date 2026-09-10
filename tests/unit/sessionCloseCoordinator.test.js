@@ -32,8 +32,29 @@ describe('session close coordination', () => {
     expect(contextClose).toHaveBeenCalledTimes(1);
   });
 
+  test('destroyed hook failures are reported without rejecting teardown', async () => {
+    const onDestroyedError = jest.fn();
+    const coordinator = createSessionCloseCoordinator();
+    const session = { context: { close: jest.fn(async () => {}) } };
+
+    await expect(coordinator.close(session, {
+      emitDestroyed: async () => { throw new Error('plugin failed'); },
+      onDestroyedError,
+    })).resolves.toBeUndefined();
+    expect(onDestroyedError).toHaveBeenCalledWith(expect.objectContaining({ message: 'plugin failed' }));
+  });
+
   test('server delegates closeSession teardown to the coordinator', () => {
     expect(serverSrc).toContain("from './lib/session-close.js'");
     expect(serverSrc).toMatch(/sessionCloseCoordinator\.close\(/);
+    expect(serverSrc).toMatch(/try \{\s*await sessionCloseCoordinator\.close[\s\S]*?finally \{[\s\S]*?sessions\.delete\(key\)/);
+  });
+
+  test('legacy tab operations refresh session access time', () => {
+    for (const route of ["app.post('/navigate'", "app.get('/snapshot'", "app.post('/act'"]) {
+      const start = serverSrc.indexOf(route);
+      const end = serverSrc.indexOf('\n});', start);
+      expect(serverSrc.slice(start, end)).toContain('session.lastAccess = Date.now()');
+    }
   });
 });

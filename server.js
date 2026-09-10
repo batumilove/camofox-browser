@@ -51,6 +51,7 @@ import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js'
 import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
 import {
   profilePathsFromProcessSnapshot,
+  refreshOwnedProcessSnapshot,
   signalOwnedProcess,
   snapshotOwnedBrowserProcesses,
   snapshotOwnedProcessDescendants,
@@ -60,6 +61,7 @@ import {
 } from './lib/process-ownership.js';
 import { TabAdmissionController, TabAdmissionError, createTabAdmissionShutdownError } from './lib/tab-admission.js';
 import { createSessionCloseCoordinator } from './lib/session-close.js';
+import { CapacityReservations } from './lib/capacity-reservations.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
   isDeadContextError, isPageCrashedError, isTimeoutError,
@@ -505,7 +507,7 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'set_cookies').inc();
     log('error', 'cookie import failed', { reqId: req.reqId, error: err.message });
-    res.status(500).json({ error: safeError(err) });
+    res.status(err.statusCode || 500).json({ error: safeError(err), ...(err.code ? { code: err.code } : {}) });
   }
 });
 
@@ -537,6 +539,12 @@ let _nativeMemBaseline = null; // RSS - heapUsed at first idle measurement
 const FAILURE_THRESHOLD = 3;
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 const TAB_LOCK_TIMEOUT_MS = 35000; // Must be > HANDLER_TIMEOUT_MS so active op times out first
+
+const capacityReservations = new CapacityReservations({
+  maxSessions: MAX_SESSIONS,
+  maxTabsPerSession: MAX_TABS_PER_SESSION,
+  maxTabsGlobal: MAX_TABS_GLOBAL,
+});
 
 
 
@@ -714,7 +722,13 @@ if (proxyPool) {
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
 let browserIdleTimer = null;
 let browserLaunchPromise = null;
+let browserLaunchGeneration = 0;
 let browserWarmRetryTimer = null;
+
+function invalidateBrowserLaunch() {
+  browserLaunchGeneration += 1;
+  return browserLaunchPromise;
+}
 
 // Tracks why the browser was last stopped. Intentional reasons (idle_shutdown, admin_stop)
 // keep /health returning 200. Unexpected reasons trigger 503 + warm retry.
@@ -875,6 +889,30 @@ function getTotalTabCount() {
   return total;
 }
 
+function getSessionTabCount(session) {
+  let total = 0;
+  for (const group of session.tabGroups.values()) total += group.size;
+  return total;
+}
+
+async function reserveTabCreation(userId, session, reqId) {
+  const key = normalizeUserId(userId);
+  let release = capacityReservations.reserveTab(key, getSessionTabCount(session), getTotalTabCount());
+  if (release) return release;
+
+  const recycled = await recycleOldestTab(session, reqId, key);
+  if (recycled) {
+    release = capacityReservations.reserveTab(key, getSessionTabCount(session), getTotalTabCount());
+  }
+  if (!release) {
+    throw Object.assign(new Error('Maximum tabs per session reached'), {
+      statusCode: 429,
+      code: 'tab_capacity_reached',
+    });
+  }
+  return release;
+}
+
 // Virtual display for WebGL support and anti-detection.
 // Xvfb gives Firefox a real X display with GLX, enabling software-rendered WebGL
 // via Mesa llvmpipe. Without this, WebGL returns "no context" -- a massive bot signal.
@@ -973,18 +1011,6 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
       }
     }
   };
-}
-
-function refreshOwnedProcessSnapshot(snapshot) {
-  if (process.platform !== 'linux' || snapshot.length === 0) return snapshot;
-  const refreshed = new Map();
-  for (const identity of survivingOwnedBrowserProcesses(snapshot)) {
-    const tree = snapshotOwnedBrowserProcesses(process.pid, '/proc', identity.pid);
-    const root = tree.find(proc => proc.pid === identity.pid);
-    if (!root || root.startTime !== identity.startTime) continue;
-    for (const proc of tree) refreshed.set(`${proc.pid}:${proc.startTime}`, proc);
-  }
-  return [...refreshed.values()];
 }
 
 /**
@@ -1147,14 +1173,14 @@ async function buildLaunchOptionsWithGeoipFallback(baseOptions, attemptMeta) {
   }
 }
 
-async function launchBrowserInstance() {
+async function launchBrowserInstance(launchGeneration) {
   const hostOS = getHostOS();
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
   const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (tabAdmission.closed) {
+    if (tabAdmission.closed || launchGeneration !== browserLaunchGeneration) {
       throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
     }
     const launchProxy = proxyPool
@@ -1269,7 +1295,7 @@ async function launchBrowserInstance() {
       // A launch that outlives its admitted request (for example after the
       // outer launch timeout) must not publish a fresh browser during shutdown.
       // The catch path below closes the candidate and kills its captured tree.
-      if (tabAdmission.closed) {
+      if (tabAdmission.closed || launchGeneration !== browserLaunchGeneration) {
         throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
       }
 
@@ -1326,13 +1352,29 @@ async function ensureBrowser() {
     await closeBrowserFully('browser_disconnected');
   }
   if (browser) return browser;
-  if (browserLaunchPromise) return browserLaunchPromise;
   const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
-  browserLaunchPromise = Promise.race([
-    launchBrowserInstance(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
-  ]).finally(() => { browserLaunchPromise = null; });
-  return browserLaunchPromise;
+  if (!browserLaunchPromise) {
+    const launchGeneration = browserLaunchGeneration;
+    const launch = launchBrowserInstance(launchGeneration);
+    const tracked = launch.finally(() => {
+      if (browserLaunchPromise === tracked) browserLaunchPromise = null;
+    });
+    browserLaunchPromise = tracked;
+  }
+
+  // Time out this caller without releasing the single-flight launch. The
+  // underlying promise retains ownership until it really settles, preventing
+  // overlapping launches after a slow Playwright startup.
+  let timeout;
+  return Promise.race([
+    browserLaunchPromise,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)),
+        launchTimeoutMs,
+      );
+    }),
+  ]).finally(() => clearTimeout(timeout));
 }
 
 // Helper to normalize userId to string (JSON body may parse as number)
@@ -1376,7 +1418,8 @@ async function closeSession(userId, session, {
   }
 
   session._closing = true;
-  await sessionCloseCoordinator.close(session, {
+  try {
+    await sessionCloseCoordinator.close(session, {
     emitDestroying: () => pluginEvents.emitAsync('session:destroying', {
       userId: key,
       reason,
@@ -1403,10 +1446,14 @@ async function closeSession(userId, session, {
     onDestroyingError: err => log('warn', 'session:destroying listener failed', {
       userId: key, error: err.message,
     }),
-  });
-  if (sessions.get(key) === session) sessions.delete(key);
-
-  refreshActiveTabsGauge();
+    onDestroyedError: err => log('warn', 'session:destroyed listener failed', {
+      userId: key, error: err.message,
+    }),
+    });
+  } finally {
+    if (sessions.get(key) === session) sessions.delete(key);
+    refreshActiveTabsGauge();
+  }
 }
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
@@ -1439,12 +1486,17 @@ async function getSession(userId, { trace = false } = {}) {
   
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
-      if (sessions.size >= MAX_SESSIONS) {
+      // Count closing sessions until their contexts are actually gone; allowing
+      // a same-key replacement to subtract one here can exceed the resource cap.
+      const activeSessions = sessions.size;
+      const releaseSessionReservation = capacityReservations.reserveSession(key, activeSessions);
+      if (!releaseSessionReservation) {
         throw Object.assign(
           new Error('Maximum concurrent sessions reached'),
           { statusCode: 503, code: 'admission_rejected' }
         );
       }
+      try {
       // Memory admission control (Fly.io only) — reject new sessions when
       // system memory is critically low. 503 tells Fly Proxy to try another machine.
       if (FLY_MACHINE_ID) {
@@ -1510,6 +1562,9 @@ async function getSession(userId, { trace = false } = {}) {
         proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
       });
       return created;
+      } finally {
+        releaseSessionReservation();
+      }
     });
   }
   session.lastAccess = Date.now();
@@ -1891,19 +1946,39 @@ function attachPopupHandler(page, userId, sessionKey) {
   page.on('popup', (popupPage) => {
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);
-    if (!currentSession || currentSession._closing) return;
+    if (!currentSession || currentSession._closing) {
+      safePageClose(popupPage).catch(() => {});
+      return;
+    }
 
-    const popupTabId = fly.makeTabId();
-    const popupTabState = createTabState(popupPage);
-    attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
-    const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
-    popupGroup.set(popupTabId, popupTabState);
-    currentSession.lastAccess = Date.now();
-    refreshActiveTabsGauge();
-    log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
-    pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
-    // Recursively handle popups from the popup
-    attachPopupHandler(popupPage, userId, sessionKey);
+    // The popup already exists in context.pages(), so subtract it from the
+    // observed global count while reserving the slot that will track it.
+    const releaseReservation = capacityReservations.reserveTab(
+      key,
+      getSessionTabCount(currentSession),
+      Math.max(0, getTotalTabCount() - 1),
+    );
+    if (!releaseReservation) {
+      log('warn', 'popup rejected by tab capacity', { userId: key, url: safePageUrl(popupPage) });
+      safePageClose(popupPage).catch(() => {});
+      return;
+    }
+
+    try {
+      const popupTabId = fly.makeTabId();
+      const popupTabState = createTabState(popupPage);
+      attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
+      const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
+      popupGroup.set(popupTabId, popupTabState);
+      currentSession.lastAccess = Date.now();
+      refreshActiveTabsGauge();
+      log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
+      pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
+      // Recursively handle popups from the popup
+      attachPopupHandler(popupPage, userId, sessionKey);
+    } finally {
+      releaseReservation();
+    }
   });
 }
 
@@ -3037,29 +3112,22 @@ app.post('/tabs', async (req, res) => {
         );
       }
       let session = await getSession(userId, { trace: !!trace });
-      
-      let totalTabs = 0;
-      for (const group of session.tabGroups.values()) totalTabs += group.size;
-      
-      // Recycle oldest tab when limits are reached instead of rejecting
-      if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-        const recycled = await recycleOldestTab(session, req.reqId, userId);
-        if (!recycled) {
-          throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
-        }
-      }
-      
-      const createdPage = await createPageWithRecoveryForUser(userId, session, { trace: !!trace });
-      session = createdPage.session;
-      const page = createdPage.page;
-      const lease = createdPage.lease;
-      const group = getTabGroup(session, resolvedSessionKey);
-
+      const releaseTabReservation = await reserveTabCreation(userId, session, req.reqId);
+      let page;
+      let tabState;
       const tabId = fly.makeTabId();
-      let tabState = createTabState(page);
-      attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-      group.set(tabId, tabState);
-      releasePageLease(session, lease);
+      try {
+        const createdPage = await createPageWithRecoveryForUser(userId, session, { trace: !!trace });
+        session = createdPage.session;
+        page = createdPage.page;
+        const group = getTabGroup(session, resolvedSessionKey);
+        tabState = createTabState(page);
+        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+        group.set(tabId, tabState);
+        releasePageLease(session, createdPage.lease);
+      } finally {
+        releaseTabReservation();
+      }
       attachPopupHandler(page, userId, resolvedSessionKey);
       refreshActiveTabsGauge();
       
@@ -3084,12 +3152,19 @@ app.post('/tabs', async (req, res) => {
             }
             session = await getSession(userId, { trace: !!trace });
             const retryGroup = getTabGroup(session, resolvedSessionKey);
-            const { page: retryPage, lease: retryLease } = await createLeasedPage(session);
-            tabState = createTabState(retryPage);
-            tabState.lastRequestedUrl = url;
-            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-            retryGroup.set(tabId, tabState);
-            releasePageLease(session, retryLease);
+            const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
+            let retryPage;
+            try {
+              const retryCreated = await createLeasedPage(session);
+              retryPage = retryCreated.page;
+              tabState = createTabState(retryPage);
+              tabState.lastRequestedUrl = url;
+              attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+              retryGroup.set(tabId, tabState);
+              releasePageLease(session, retryCreated.lease);
+            } finally {
+              releaseRetryReservation();
+            }
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
             const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
@@ -6384,25 +6459,21 @@ app.post('/tabs/open', async (req, res) => {
 
     const result = await tabAdmission.run(userId, async () => {
       let session = await getSession(userId);
-    
-    // Recycle oldest tab when limits are reached instead of rejecting
-    let totalTabs = 0;
-    for (const g of session.tabGroups.values()) totalTabs += g.size;
-    if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId, userId);
-      if (!recycled) {
-        throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
+      const releaseTabReservation = await reserveTabCreation(userId, session, req.reqId);
+      let group = getTabGroup(session, listItemId);
+      let page;
+      let tabState;
+      const tabId = fly.makeTabId();
+      try {
+        const created = await createLeasedPage(session);
+        page = created.page;
+        tabState = createTabState(page);
+        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+        group.set(tabId, tabState);
+        releasePageLease(session, created.lease);
+      } finally {
+        releaseTabReservation();
       }
-    }
-    
-    let group = getTabGroup(session, listItemId);
-    
-    let { page, lease } = await createLeasedPage(session);
-    const tabId = fly.makeTabId();
-    let tabState = createTabState(page);
-    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-    group.set(tabId, tabState);
-    releasePageLease(session, lease);
     attachPopupHandler(page, userId, listItemId);
     refreshActiveTabsGauge();
     
@@ -6422,11 +6493,17 @@ app.post('/tabs/open', async (req, res) => {
         }
         session = await getSession(userId);
         group = getTabGroup(session, listItemId);
-        ({ page, lease } = await createLeasedPage(session));
-        tabState = createTabState(page);
-        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-        group.set(tabId, tabState);
-        releasePageLease(session, lease);
+        const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
+        try {
+          const retryCreated = await createLeasedPage(session);
+          page = retryCreated.page;
+          tabState = createTabState(page);
+          attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+          group.set(tabId, tabState);
+          releasePageLease(session, retryCreated.lease);
+        } finally {
+          releaseRetryReservation();
+        }
         attachPopupHandler(page, userId, listItemId);
         refreshActiveTabsGauge();
         await withPageLoadDuration('open_url', () => navigatePage(page, url));
@@ -6538,7 +6615,11 @@ app.post('/stop', async (req, res) => {
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
+    const invalidatedLaunch = invalidateBrowserLaunch();
     await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
+    await invalidatedLaunch?.catch((err) => {
+      log('info', 'invalidated browser launch settled during admin stop', { error: err.message });
+    });
     await closeBrowserFully('admin_stop');
     res.json({ ok: true, stopped: true, profile: 'camoufox' });
   } catch (err) {
@@ -6607,6 +6688,7 @@ app.post('/navigate', async (req, res) => {
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
+    session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -6703,6 +6785,7 @@ app.get('/snapshot', async (req, res) => {
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
+    session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -6873,6 +6956,7 @@ app.post('/act', async (req, res) => {
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
+    session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -7122,6 +7206,7 @@ async function gracefulShutdown(signal) {
   forceTimeout.unref();
 
   tabAdmission.shutdown();
+  const invalidatedLaunch = invalidateBrowserLaunch();
   const serverClosed = new Promise(resolve => {
     server.close((err) => {
       if (err) log('error', 'server close failed', { error: err.message });
@@ -7132,7 +7217,13 @@ async function gracefulShutdown(signal) {
 
   // Let already-admitted POST /tabs operations and all other in-flight HTTP
   // handlers finish before lifecycle hooks snapshot and close session state.
-  await Promise.all([serverClosed, tabAdmission.waitForSettled()]);
+  await Promise.all([
+    serverClosed,
+    tabAdmission.waitForSettled(),
+    invalidatedLaunch?.catch((err) => {
+      log('info', 'invalidated browser launch settled during shutdown', { error: err.message });
+    }),
+  ]);
 
   await pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
     log('error', 'server:shutdown listener failed', { error: err.message });
