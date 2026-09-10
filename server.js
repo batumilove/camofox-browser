@@ -1301,15 +1301,9 @@ async function launchBrowserInstance() {
         proxySession: launchProxy?.sessionId || null,
       });
       await candidateBrowser?.close().catch(() => {});
-      if (launchBaseline) {
-        candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(
-          process.pid,
-          browserExecutablePath,
-          '/proc',
-          launchBaseline,
-        )
-          .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
-      }
+      // Never re-infer ownership after closing the candidate. An initially
+      // ambiguous set could shrink to one unrelated concurrent browser and
+      // become unsafe to signal. Preserve the first attribution result.
       await _forceKillBrowserProcesses('launch_attempt_failed', candidateOwnedProcesses);
       if (localVirtualDisplay) localVirtualDisplay.kill();
     }

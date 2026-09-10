@@ -192,8 +192,10 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   const source = fs.readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
   const displayClass = source.match(/class DefaultVirtualDisplay[\s\S]*?\n}\n\nlet virtualDisplay/)?.[0] ?? '';
   const survivorCleanup = source.match(/async function _forceKillBrowserProcesses[\s\S]*?\n}\n/)?.[0] ?? '';
+  const launchFailureCleanup = source.match(/await candidateBrowser\?\.close[\s\S]*?await _forceKillBrowserProcesses\('launch_attempt_failed'/)?.[0] ?? '';
   expect(displayClass).toContain('terminateOwnedProcess(');
   expect(survivorCleanup).toContain('signalOwnedProcess(');
+  expect(launchFailureCleanup).not.toContain('snapshotOwnedProcessTreesByExecutable(');
   expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
   expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
   expect(source).toContain('snapshotOwnedProcessTreesByExecutable(');

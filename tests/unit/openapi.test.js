@@ -199,12 +199,13 @@ describe('OpenAPI spec', () => {
     expect(unresolved).toEqual([]);
   });
 
-  test('openapi.json in repo root is up to date', () => {
+  test.each(['openapi.json', join('docs', 'openapi.json')])('%s is up to date', relativePath => {
+    const absolutePath = join(__dirname, '..', '..', relativePath);
     let committed;
     try {
-      committed = JSON.parse(readFileSync(join(__dirname, '..', '..', 'openapi.json'), 'utf8'));
+      committed = JSON.parse(readFileSync(absolutePath, 'utf8'));
     } catch {
-      throw new Error('openapi.json not found -- run: npm run generate-openapi');
+      throw new Error(`${relativePath} not found -- run: npm run generate-openapi`);
     }
     expect(committed).toEqual(spec);
   });

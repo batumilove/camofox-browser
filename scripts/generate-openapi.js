@@ -19,6 +19,8 @@ const spec = swaggerJsdoc({
   apis: [join(root, 'server.js')],
 });
 
-const out = join(root, 'openapi.json');
-writeFileSync(out, JSON.stringify(spec, null, 2) + '\n');
-console.log(`Wrote ${Object.keys(spec.paths).length} paths to openapi.json`);
+const serialized = JSON.stringify(spec, null, 2) + '\n';
+for (const out of [join(root, 'openapi.json'), join(root, 'docs', 'openapi.json')]) {
+  writeFileSync(out, serialized);
+}
+console.log(`Wrote ${Object.keys(spec.paths).length} paths to openapi.json and docs/openapi.json`);
