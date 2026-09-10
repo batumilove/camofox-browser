@@ -19,9 +19,11 @@
 >
 > Built by the team behind <a href="https://askjo.ai?ref=camofox"><strong>jo, a personal AI agent</strong></a> that runs half on your Mac, half on a dedicated cloud machine just for you -- with zero maintenance needed. Available on macOS, Telegram, WhatsApp, and email. <a href="https://askjo.ai?ref=camofox">Try the beta free -></a>
 
-> <a href="https://x.com/pradeep24"><img src="https://unavatar.io/x/pradeep24" alt="Pradeep Elankumaran" width="80" height="80" align="left" /></a>
+> <a href="https://x.com/pradeep24"><img src="pradeep-profile.png" alt="Pradeep Elankumaran" width="80" height="80" align="left" /></a>
 >
 > <a href="https://x.com/pradeep24"><strong>Pradeep Elankumaran (@pradeep24)</strong></a> — co-founder and technical CEO at Jo.
+>
+> <br clear="left" />
 
 <br/>
 
