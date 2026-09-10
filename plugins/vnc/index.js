@@ -160,6 +160,7 @@ export async function register(app, ctx, pluginConfig = {}) {
 
       await events.emitAsync('session:storage:export', {
         userId: String(userId),
+        context: session.context,
         storageState: state,
       });
 

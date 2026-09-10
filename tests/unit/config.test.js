@@ -105,6 +105,8 @@ describe('loadConfig', () => {
     process.env.TAB_ADMISSION_MAX_ACTIVE = '6';
     process.env.TAB_ADMISSION_MAX_ACTIVE_PER_USER = '3';
     process.env.TAB_ADMISSION_MAX_ABANDONED = '2';
+    process.env.TAB_ADMISSION_MAX_WAITING = '12';
+    process.env.TAB_ADMISSION_MAX_WAITING_PER_USER = '5';
     process.env.TAB_ADMISSION_WAIT_TIMEOUT_MS = '1200';
     process.env.TAB_ADMISSION_OPERATION_TIMEOUT_MS = '15000';
     process.env.TAB_ADMISSION_RETRY_AFTER = '4';
@@ -115,6 +117,8 @@ describe('loadConfig', () => {
       tabAdmissionMaxActive: 6,
       tabAdmissionMaxActivePerUser: 3,
       tabAdmissionMaxAbandoned: 2,
+      tabAdmissionMaxWaiting: 12,
+      tabAdmissionMaxWaitingPerUser: 5,
       tabAdmissionWaitTimeoutMs: 1200,
       tabAdmissionOperationTimeoutMs: 15000,
       tabAdmissionRetryAfter: 4,
@@ -124,6 +128,8 @@ describe('loadConfig', () => {
       'TAB_ADMISSION_MAX_ACTIVE',
       'TAB_ADMISSION_MAX_ACTIVE_PER_USER',
       'TAB_ADMISSION_MAX_ABANDONED',
+      'TAB_ADMISSION_MAX_WAITING',
+      'TAB_ADMISSION_MAX_WAITING_PER_USER',
       'TAB_ADMISSION_WAIT_TIMEOUT_MS',
       'TAB_ADMISSION_OPERATION_TIMEOUT_MS',
       'TAB_ADMISSION_RETRY_AFTER',

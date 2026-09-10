@@ -87,11 +87,31 @@ describe('persistence plugin', () => {
         indexedDB: [{ name: 'auth', version: 1, stores: [] }],
       }],
     };
-    await events.emitAsync('session:storage:export', { userId: 'user-export', storageState });
+    const context = { storageState: jest.fn() };
+    await events.emitAsync('session:created', { userId: 'user-export', context });
+    await events.emitAsync('session:storage:export', { userId: 'user-export', context, storageState });
 
     const { getUserPersistencePaths } = await import('../../lib/persistence.js');
     const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-export');
     expect(JSON.parse(await fs.readFile(storageStatePath, 'utf8'))).toEqual(storageState);
+  });
+
+  test('storage export from a replaced context cannot publish stale state', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const contextA = { storageState: jest.fn() };
+    const contextB = { storageState: jest.fn() };
+    await events.emitAsync('session:created', { userId: 'export-race', context: contextA });
+    await events.emitAsync('session:created', { userId: 'export-race', context: contextB });
+
+    await events.emitAsync('session:storage:export', {
+      userId: 'export-race',
+      context: contextA,
+      storageState: { cookies: [{ name: 'stale', value: '1' }], origins: [] },
+    });
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'export-race');
+    await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   test('checkpoints on session:destroying', async () => {

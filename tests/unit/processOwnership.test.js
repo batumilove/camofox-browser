@@ -45,6 +45,19 @@ test('cleanup snapshot never adopts another scoped server browser', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('explicit owned roots capture custom browser and Xvfb executable names', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
+  proc(root, 100, 1, 'node\0server.js');
+  proc(root, 101, 100, '/opt/x11/Xvfb\0:10');
+  proc(root, 102, 100, '/opt/custom/browser-enterprise\0--headless');
+  proc(root, 103, 102, 'GeckoChildProcess\0-contentproc');
+  proc(root, 104, 100, '/usr/bin/yt-dlp\0https://example.test');
+
+  expect(snapshotOwnedBrowserProcesses(100, root, 101).map(p => p.pid)).toEqual([101]);
+  expect(snapshotOwnedBrowserProcesses(100, root, 102).map(p => p.pid)).toEqual([102, 103]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('only captured descendants survive reparenting; unrelated PID 1 browsers do not', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
   proc(root, 100, 1, 'node\0server.js');
@@ -106,4 +119,6 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   const survivorCleanup = source.match(/async function _forceKillBrowserProcesses[\s\S]*?\n}\n/)?.[0] ?? '';
   expect(displayClass).toContain('signalOwnedProcess(');
   expect(survivorCleanup).toContain('signalOwnedProcess(');
+  expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
+  expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
 });

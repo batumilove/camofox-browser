@@ -136,6 +136,8 @@ const tabAdmission = new TabAdmissionController({
   maxActive: CONFIG.tabAdmissionMaxActive,
   maxActivePerUser: CONFIG.tabAdmissionMaxActivePerUser,
   maxAbandoned: CONFIG.tabAdmissionMaxAbandoned,
+  maxWaiting: CONFIG.tabAdmissionMaxWaiting,
+  maxWaitingPerUser: CONFIG.tabAdmissionMaxWaitingPerUser,
   waitTimeoutMs: CONFIG.tabAdmissionWaitTimeoutMs,
   operationTimeoutMs: CONFIG.tabAdmissionOperationTimeoutMs,
   retryAfter: CONFIG.tabAdmissionRetryAfter,
@@ -886,7 +888,7 @@ class DefaultVirtualDisplay extends VirtualDisplay {
 
   get() {
     const display = super.get();
-    this.ownedProcessIdentity = snapshotOwnedBrowserProcesses(process.pid)
+    this.ownedProcessIdentity = snapshotOwnedBrowserProcesses(process.pid, '/proc', this.proc?.pid)
       .find(proc => proc.pid === this.proc?.pid) || null;
     return display;
   }
@@ -991,7 +993,9 @@ async function _closeBrowserFullyImpl(reason) {
   // Capture ownership before Playwright closes and reparents its children.
   // Multiple scoped servers may share a host, so a later /proc name scan must
   // never treat another server's browser as one of our survivors.
-  const ownedBrowserProcesses = snapshotOwnedBrowserProcesses(process.pid);
+  const ownedBrowserProcesses = pid
+    ? snapshotOwnedBrowserProcesses(process.pid, '/proc', pid)
+    : [];
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
 
@@ -2900,7 +2904,7 @@ app.post('/pressure/cleanup', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       429:
- *         description: Admission timed out before start (`tab_admission_wait_timeout`) or while creating the tab (`tab_admission_operation_timeout`).
+ *         description: Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), or timed out while creating the tab (`tab_admission_operation_timeout`).
  *         headers:
  *           Retry-After:
  *             description: Seconds to wait before retrying.
@@ -2915,7 +2919,7 @@ app.post('/pressure/cleanup', async (req, res) => {
  *                   properties:
  *                     code:
  *                       type: string
- *                       enum: [tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated]
+ *                       enum: [tab_admission_wait_saturated, tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated]
  *       409:
  *         description: Cannot enable tracing on an existing session.
  *         content:

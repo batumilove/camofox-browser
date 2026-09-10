@@ -492,7 +492,7 @@
             }
           },
           "429": {
-            "description": "Admission timed out before start (`tab_admission_wait_timeout`) or while creating the tab (`tab_admission_operation_timeout`).",
+            "description": "Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), or timed out while creating the tab (`tab_admission_operation_timeout`).",
             "headers": {
               "Retry-After": {
                 "description": "Seconds to wait before retrying.",
@@ -514,6 +514,7 @@
                         "code": {
                           "type": "string",
                           "enum": [
+                            "tab_admission_wait_saturated",
                             "tab_admission_wait_timeout",
                             "tab_admission_operation_timeout",
                             "tab_admission_abandoned_saturated"

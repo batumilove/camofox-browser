@@ -266,9 +266,10 @@ describe('vnc plugin', () => {
   test('emits vnc:storage:exported and session:storage:export on export', async () => {
     await register(mockApp, ctx, { enabled: true });
 
-    ctx.sessions.set('user-1', {
+    const session = {
       context: { storageState: jest.fn(async () => ({ cookies: [], origins: [] })) },
-    });
+    };
+    ctx.sessions.set('user-1', session);
 
     const exported = [];
     events.on('vnc:storage:exported', (e) => exported.push(e));
@@ -284,6 +285,7 @@ describe('vnc plugin', () => {
     expect(exported[0]).toMatchObject({ userId: 'user-1' });
     expect(exported[1]).toMatchObject({
       userId: 'user-1',
+      context: session.context,
       storageState: { cookies: [], origins: [] },
     });
   });

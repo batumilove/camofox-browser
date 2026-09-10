@@ -146,10 +146,9 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // When another plugin exports storage state, persist that exact snapshot so
   // the browser is serialized only once and the exported/checkpointed data match.
-  events.on('session:storage:export', async ({ userId, storageState }) => {
-    if (storageState) {
-      await checkpoint(userId, undefined, 'storage_export', storageState);
-    }
+  events.on('session:storage:export', async ({ userId, context, storageState }) => {
+    if (!context || activeSessions.get(userId) !== context || !storageState) return;
+    await checkpoint(userId, context, 'storage_export', storageState);
   });
 
   // On session destroying (pre-close): checkpoint while context is still alive
