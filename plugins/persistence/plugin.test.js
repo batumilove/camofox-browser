@@ -85,10 +85,12 @@ describe('persistence plugin', () => {
 
   test('late destruction of session A neither checkpoints nor untracks replacement session B', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
-    let releaseCheckpoint;
+    let releaseCheckpoint, markCheckpointStarted;
+    const checkpointStarted = new Promise((resolve) => { markCheckpointStarted = resolve; });
     const checkpointGate = new Promise((resolve) => { releaseCheckpoint = resolve; });
     const contextA = {
       storageState: jest.fn(async ({ path: p }) => {
+        markCheckpointStarted();
         await checkpointGate;
         await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
       }),
@@ -105,7 +107,7 @@ describe('persistence plugin', () => {
       context: contextA,
       reason: 'proxy_retry_rotate',
     });
-    await new Promise(setImmediate);
+    await checkpointStarted;
     expect(contextA.storageState).toHaveBeenCalledTimes(1);
 
     await events.emitAsync('session:created', { userId: 'race-user', context: contextB });

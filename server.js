@@ -1252,7 +1252,12 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroying', {
+    userId: key,
+    reason,
+    session,
+    context: session.context,
+  });
   if (session.tracePath) {
     try {
       await session.context.tracing.stop({ path: session.tracePath });
@@ -1263,7 +1268,12 @@ async function closeSession(userId, session, {
   }
 
   await session.context.close().catch(() => {});
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroyed', {
+    userId: key,
+    reason,
+    session,
+    context: session.context,
+  });
 
   refreshActiveTabsGauge();
 }

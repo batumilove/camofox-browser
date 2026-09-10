@@ -26,9 +26,9 @@ describe('session:destroying event ordering', () => {
    *   3. pluginEvents.emitAsync('session:destroyed', ...)
    */
   async function simulateCloseSession(pluginEvents, session, userId, reason) {
-    await pluginEvents.emitAsync('session:destroying', { userId, reason });
+    await pluginEvents.emitAsync('session:destroying', { userId, reason, session, context: session.context });
     await session.context.close();
-    await pluginEvents.emitAsync('session:destroyed', { userId, reason });
+    await pluginEvents.emitAsync('session:destroyed', { userId, reason, session, context: session.context });
   }
 
   function makeMockContext() {
@@ -192,16 +192,14 @@ describe('persistence plugin with session:destroying', () => {
       activeSessions.set(userId, context);
     });
 
-    events.on('session:destroying', async ({ userId, reason }) => {
-      const context = activeSessions.get(userId);
-      if (context) {
-        await checkpoint(userId, context, reason).catch(() => {});
-        activeSessions.delete(userId);
-      }
+    events.on('session:destroying', async ({ userId, context, reason }) => {
+      if (!context || activeSessions.get(userId) !== context) return;
+      await checkpoint(userId, context, reason).catch(() => {});
+      if (activeSessions.get(userId) === context) activeSessions.delete(userId);
     });
 
-    events.on('session:destroyed', async ({ userId }) => {
-      activeSessions.delete(userId);
+    events.on('session:destroyed', async ({ userId, context }) => {
+      if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
     });
 
     return { activeSessions, checkpointCalls };
@@ -220,9 +218,9 @@ describe('persistence plugin with session:destroying', () => {
   }
 
   async function simulateCloseSession(pluginEvents, session, userId, reason) {
-    await pluginEvents.emitAsync('session:destroying', { userId, reason });
+    await pluginEvents.emitAsync('session:destroying', { userId, reason, session, context: session.context });
     await session.context.close();
-    await pluginEvents.emitAsync('session:destroyed', { userId, reason });
+    await pluginEvents.emitAsync('session:destroyed', { userId, reason, session, context: session.context });
   }
 
   test('checkpoints successfully during destroying (context alive)', async () => {
@@ -250,11 +248,11 @@ describe('persistence plugin with session:destroying', () => {
     await events.emitAsync('session:created', { userId: 'user-1', context });
 
     // destroying removes from activeSessions
-    await events.emitAsync('session:destroying', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroying', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
 
     // destroyed is a no-op (already removed) but doesn't error
-    await events.emitAsync('session:destroyed', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroyed', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
   });
 
@@ -267,7 +265,7 @@ describe('persistence plugin with session:destroying', () => {
     expect(activeSessions.has('user-1')).toBe(true);
 
     // Skip destroying, go straight to destroyed (backward compat scenario)
-    await events.emitAsync('session:destroyed', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroyed', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
   });
 

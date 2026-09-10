@@ -101,17 +101,15 @@ export async function register(app, ctx, pluginConfig = {}) {
   });
 
   // On session destroying (pre-close): checkpoint while context is still alive
-  events.on('session:destroying', async ({ userId, reason }) => {
-    const context = activeSessions.get(userId);
-    if (context) {
-      await checkpoint(userId, context, reason).catch(() => {});
-      activeSessions.delete(userId);
-    }
+  events.on('session:destroying', async ({ userId, context, reason }) => {
+    if (!context || activeSessions.get(userId) !== context) return;
+    await checkpoint(userId, context, reason).catch(() => {});
+    if (activeSessions.get(userId) === context) activeSessions.delete(userId);
   });
 
   // On session destroyed (post-close): cleanup tracking if not already done
-  events.on('session:destroyed', async ({ userId }) => {
-    activeSessions.delete(userId);
+  events.on('session:destroyed', async ({ userId, context }) => {
+    if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
   });
 
   // On shutdown: checkpoint all remaining sessions
