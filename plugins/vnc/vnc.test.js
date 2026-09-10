@@ -44,6 +44,7 @@ class MockVirtualDisplay {
   constructor() {
     this.proc = null;
     this._display = 99;
+    this.xvfbDisplayFilesCleanupRegistered = false;
   }
 
   get display() {
@@ -55,7 +56,13 @@ class MockVirtualDisplay {
   }
 
   kill() {
-    if (this.proc && !this.proc.killed) this.proc.kill();
+    if (!this.proc || this.xvfbDisplayFilesCleanupRegistered) return false;
+    this.xvfbDisplayFilesCleanupRegistered = true;
+    const cleanup = () => mockRemoveXvfbDisplayFiles(this.display);
+    if (this.proc.exitCode === null) this.proc.once('exit', cleanup);
+    else cleanup();
+    if (!this.proc.killed) this.proc.kill();
+    return true;
   }
 }
 
@@ -288,6 +295,15 @@ describe('vnc plugin', () => {
       context: session.context,
       storageState: { cookies: [], origins: [] },
     });
+  });
+
+  test('VNC virtual display delegates signaling without pre-setting the base kill guard', async () => {
+    await register(mockApp, ctx, { enabled: true });
+    const display = ctx.createVirtualDisplay();
+    display.proc = { killed: false, kill: jest.fn() };
+
+    expect(display.kill()).toBe(true);
+    expect(display.proc.kill).toHaveBeenCalledTimes(1);
   });
 
   test('watcher is killed on server:shutdown', async () => {

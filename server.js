@@ -49,8 +49,13 @@ import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
 import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
-import { killProcessIds } from './lib/browser-processes.js';
-import { snapshotOwnedBrowserProcesses, signalOwnedProcess, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from './lib/process-ownership.js';
+import {
+  profilePathsFromProcessSnapshot,
+  signalOwnedProcess,
+  snapshotOwnedBrowserProcesses,
+  snapshotOwnedProcessDescendants,
+  survivingOwnedBrowserProcesses,
+} from './lib/process-ownership.js';
 import { TabAdmissionController, TabAdmissionError } from './lib/tab-admission.js';
 import { createSessionCloseCoordinator } from './lib/session-close.js';
 import {
@@ -493,7 +498,7 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
     await session.context.addCookies(sanitized);
     const result = { ok: true, userId: String(userId), count: sanitized.length };
     log('info', 'cookies imported', { reqId: req.reqId, userId: String(userId), count: sanitized.length });
-    pluginEvents.emit('session:cookies:import', { userId: String(userId), count: sanitized.length });
+    await pluginEvents.emitAsync('session:cookies:import', { userId: String(userId), count: sanitized.length });
     res.json(result);
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'set_cookies').inc();
@@ -504,6 +509,7 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
 
 let browser = null;
 let _lastBrowserPid = null; // Track PID independently for force-kill after close
+let _ownedBrowserProcesses = []; // Launch-diff ownership when Playwright exposes no process()
 let _browserClosePromise = null; // Shared promise for concurrent close serialization
 let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale tab detection)
 // userId -> { context, tabGroups: Map<sessionKey, Map<tabId, TabState>>, lastAccess }
@@ -955,13 +961,28 @@ async function probeGoogleSearch(candidateBrowser) {
 function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
   const origClose = candidateBrowser.close.bind(candidateBrowser);
   candidateBrowser.close = async (...args) => {
-    await origClose(...args);
-    browserLaunchProxy = null;
-    if (localVirtualDisplay) {
-      localVirtualDisplay.kill();
-      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+    try {
+      return await origClose(...args);
+    } finally {
+      browserLaunchProxy = null;
+      if (localVirtualDisplay) {
+        localVirtualDisplay.kill();
+        if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+      }
     }
   };
+}
+
+function refreshOwnedProcessSnapshot(snapshot) {
+  if (process.platform !== 'linux' || snapshot.length === 0) return snapshot;
+  const refreshed = new Map();
+  for (const identity of survivingOwnedBrowserProcesses(snapshot)) {
+    const tree = snapshotOwnedBrowserProcesses(process.pid, '/proc', identity.pid);
+    const root = tree.find(proc => proc.pid === identity.pid);
+    if (!root || root.startTime !== identity.startTime) continue;
+    for (const proc of tree) refreshed.set(`${proc.pid}:${proc.startTime}`, proc);
+  }
+  return [...refreshed.values()];
 }
 
 /**
@@ -993,9 +1014,12 @@ async function _closeBrowserFullyImpl(reason) {
   // Capture ownership before Playwright closes and reparents its children.
   // Multiple scoped servers may share a host, so a later /proc name scan must
   // never treat another server's browser as one of our survivors.
-  const ownedBrowserProcesses = pid
+  const exactRootProcesses = pid
     ? snapshotOwnedBrowserProcesses(process.pid, '/proc', pid)
     : [];
+  const ownedBrowserProcesses = exactRootProcesses.length > 0
+    ? exactRootProcesses
+    : refreshOwnedProcessSnapshot(_ownedBrowserProcesses);
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
 
@@ -1005,6 +1029,7 @@ async function _closeBrowserFullyImpl(reason) {
   // Null the ref so new requests don't use a dying browser
   browser = null;
   _lastBrowserPid = null;
+  _ownedBrowserProcesses = [];
 
   // Close through Playwright (sends CDP Browser.close, then SIGKILL process group)
   let closeTimer;
@@ -1020,10 +1045,10 @@ async function _closeBrowserFullyImpl(reason) {
   }
 
   // Force-kill only survivors captured before this close began.
-  if (pid) {
-    const browserIdentity = ownedBrowserProcesses.find(proc => proc.pid === pid);
-    await _forceKillProcessTree(browserIdentity, reason);
-  }
+  const browserIdentity = pid
+    ? ownedBrowserProcesses.find(proc => proc.pid === pid)
+    : null;
+  await _forceKillProcessTree(browserIdentity, reason);
   await _forceKillBrowserProcesses(reason, ownedBrowserProcesses);
 
   // Clean up stale Firefox temp profiles (enable_cache: true accumulates data)
@@ -1127,6 +1152,14 @@ async function launchBrowserInstance() {
   const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (tabAdmission.closed) {
+      throw new TabAdmissionError(
+        'Tab admission is shutting down',
+        'tab_admission_shutting_down',
+        CONFIG.tabAdmissionRetryAfter,
+        503,
+      );
+    }
     const launchProxy = proxyPool
       ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
       : null;
@@ -1135,6 +1168,8 @@ async function launchBrowserInstance() {
     let vdDisplay = undefined;
     const useDesktopWindow = CONFIG.interactiveMode === 'desktop';
     let candidateBrowser = null;
+    let launchBaseline = null;
+    let candidateOwnedProcesses = [];
     try {
       if (os.platform() === 'linux' && !useDesktopWindow) {
         localVirtualDisplay = virtualDisplayRegistry.create();
@@ -1193,7 +1228,13 @@ async function launchBrowserInstance() {
       options.handleSIGHUP = false;
       await pluginEvents.emitAsync('browser:launching', { options });
 
+      launchBaseline = new Set(
+        snapshotOwnedProcessDescendants(process.pid).map(proc => `${proc.pid}:${proc.startTime}`),
+      );
       candidateBrowser = await firefox.launch(options);
+      candidateOwnedProcesses = snapshotOwnedProcessDescendants(process.pid)
+        .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
+      attachBrowserCleanup(candidateBrowser, localVirtualDisplay);
 
       if (proxyPool?.canRotateSessions) {
         const probe = await probeGoogleSearch(candidateBrowser);
@@ -1206,7 +1247,7 @@ async function launchBrowserInstance() {
           });
           if (attempt < maxAttempts) {
             await candidateBrowser.close().catch(() => {});
-            if (localVirtualDisplay) localVirtualDisplay.kill();
+            await _forceKillBrowserProcesses('launch_probe_retry', candidateOwnedProcesses);
             continue;
           }
           // Last attempt: accept browser in degraded mode rather than death-spiraling.
@@ -1218,13 +1259,25 @@ async function launchBrowserInstance() {
         }
       }
 
+      // A launch that outlives its admitted request (for example after the
+      // outer launch timeout) must not publish a fresh browser during shutdown.
+      // The catch path below closes the candidate and kills its captured tree.
+      if (tabAdmission.closed) {
+        throw new TabAdmissionError(
+          'Tab admission is shutting down',
+          'tab_admission_shutting_down',
+          CONFIG.tabAdmissionRetryAfter,
+          503,
+        );
+      }
+
       virtualDisplay = localVirtualDisplay;
       browserLaunchProxy = launchProxy;
       _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
+      _ownedBrowserProcesses = candidateOwnedProcesses;
       browser = candidateBrowser; // publish AFTER PID is captured
       _lastBrowserStopReason = null; // clear — browser is healthy
       _lastBrowserRestartAt = Date.now();
-      attachBrowserCleanup(browser, localVirtualDisplay);
       pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
 
       log('info', 'camoufox launched', {
@@ -1246,6 +1299,11 @@ async function launchBrowserInstance() {
         proxySession: launchProxy?.sessionId || null,
       });
       await candidateBrowser?.close().catch(() => {});
+      if (launchBaseline) {
+        candidateOwnedProcesses = snapshotOwnedProcessDescendants(process.pid)
+          .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
+      }
+      await _forceKillBrowserProcesses('launch_attempt_failed', candidateOwnedProcesses);
       if (localVirtualDisplay) localVirtualDisplay.kill();
     }
   }
@@ -2920,6 +2978,23 @@ app.post('/pressure/cleanup', async (req, res) => {
  *                     code:
  *                       type: string
  *                       enum: [tab_admission_wait_saturated, tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated]
+ *       503:
+ *         description: Admission was rejected because the server is shutting down (`tab_admission_shutting_down`).
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying.
+ *             schema:
+ *               type: integer
+ *         content:
+ *           application/json:
+ *             schema:
+ *               allOf:
+ *                 - $ref: '#/components/schemas/Error'
+ *                 - type: object
+ *                   properties:
+ *                     code:
+ *                       type: string
+ *                       enum: [tab_admission_shutting_down]
  *       409:
  *         description: Cannot enable tracing on an existing session.
  *         content:
@@ -7020,8 +7095,18 @@ async function gracefulShutdown(signal) {
   }, 10000);
   forceTimeout.unref();
 
-  server.close();
+  tabAdmission.shutdown();
+  const serverClosed = new Promise(resolve => {
+    server.close((err) => {
+      if (err) log('error', 'server close failed', { error: err.message });
+      resolve();
+    });
+  });
   stopMemoryReporter();
+
+  // Let already-admitted POST /tabs operations and all other in-flight HTTP
+  // handlers finish before lifecycle hooks snapshot and close session state.
+  await Promise.all([serverClosed, tabAdmission.waitForSettled()]);
 
   await pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
     log('error', 'server:shutdown listener failed', { error: err.message });

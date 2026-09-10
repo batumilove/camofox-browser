@@ -129,6 +129,12 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('cookie import route awaits checkpoint listeners before responding', async () => {
+    const source = await fs.readFile(new URL('../../server.js', import.meta.url), 'utf8');
+    const route = source.match(/app\.post\('\/sessions\/:userId\/cookies'[\s\S]*?\n}\);/)?.[0] ?? '';
+    expect(route).toContain("await pluginEvents.emitAsync('session:cookies:import'");
+  });
+
   test('late destroy for an old context cannot checkpoint or remove its replacement', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
     const contextA = { storageState: jest.fn() };
@@ -223,6 +229,61 @@ describe('persistence plugin', () => {
     const { getUserPersistencePaths } = await import('../../lib/persistence.js');
     const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-race');
     await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('checkpoint bursts coalesce to one running and one latest pending write', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseFirst;
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+    let markFirstStarted;
+    const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+    const mockContext = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        if (mockContext.storageState.mock.calls.length === 1) {
+          markFirstStarted();
+          await firstBlocked;
+        }
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+    await events.emitAsync('session:created', { userId: 'burst', context: mockContext });
+    const writes = Array.from({ length: 20 }, () =>
+      events.emitAsync('session:cookies:import', { userId: 'burst' }));
+    await firstStarted;
+    expect(mockContext.storageState).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await Promise.all(writes);
+    expect(mockContext.storageState).toHaveBeenCalledTimes(2);
+  });
+
+  test('storage reset is bounded when storage serialization hangs', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir, checkpointTimeoutMs: 20 });
+    const handler = mockApp.delete.mock.calls
+      .find(c => c[0] === '/sessions/:userId/storage_state')
+      .at(-1);
+    const mockContext = { storageState: jest.fn(() => new Promise(() => {})) };
+    await events.emitAsync('session:created', { userId: 'hung', context: mockContext });
+    const hungCheckpoint = events.emitAsync('session:cookies:import', { userId: 'hung' });
+    const hungResult = hungCheckpoint.then(
+      () => ({ ok: true, error: null }),
+      error => ({ ok: false, error }),
+    );
+    await new Promise(resolve => setImmediate(resolve));
+
+    const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
+    const outcome = await Promise.race([
+      handler({ params: { userId: 'hung' } }, res).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('blocked'), 200)),
+    ]);
+    expect(outcome).toBe('completed');
+    expect(res.json).toHaveBeenCalled();
+    const checkpointOutcome = await hungResult;
+    expect(checkpointOutcome.ok).toBe(false);
+    expect(checkpointOutcome.error).toHaveProperty(
+      'message',
+      expect.stringContaining('storage checkpoint timed out'),
+    );
   });
 
   test('DELETE storage_state is idempotent without a live session or persisted file', async () => {

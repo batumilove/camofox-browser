@@ -80,6 +80,32 @@ describe('POST /tabs admission recovery', () => {
     await expect(waitingB).resolves.toBe('b');
   });
 
+  test('shutdown rejects queued/new work and waits for active raw work to settle', async () => {
+    const raw = deferred();
+    const admission = new TabAdmissionController({ maxActive: 1, waitTimeoutMs: 1000 });
+    const active = admission.run('active', () => raw.promise);
+    await new Promise(resolve => setImmediate(resolve));
+    const waiting = admission.run('waiting', async () => 'never');
+
+    admission.shutdown();
+    await expect(waiting).rejects.toMatchObject({
+      code: 'tab_admission_shutting_down',
+      statusCode: 503,
+    });
+    await expect(admission.run('new', async () => 'never')).rejects.toMatchObject({
+      code: 'tab_admission_shutting_down',
+    });
+
+    let settled = false;
+    const drained = admission.waitForSettled().then(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    raw.resolve('done');
+    await expect(active).resolves.toBe('done');
+    await drained;
+    expect(settled).toBe(true);
+  });
+
   test('server wires POST /tabs through admission and serializes admission errors', () => {
     expect(serverSrc).toContain("from './lib/tab-admission.js'");
     expect(serverSrc).toMatch(/app\.post\('\/tabs'[\s\S]*tabAdmission\.run\(/);

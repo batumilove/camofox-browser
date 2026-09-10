@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import {
   signalOwnedProcess,
+  snapshotOwnedProcessDescendants,
   snapshotOwnedBrowserProcesses,
   survivingOwnedBrowserProcesses,
   profilePathsFromProcessSnapshot,
@@ -55,6 +56,21 @@ test('explicit owned roots capture custom browser and Xvfb executable names', ()
 
   expect(snapshotOwnedBrowserProcesses(100, root, 101).map(p => p.pid)).toEqual([101]);
   expect(snapshotOwnedBrowserProcesses(100, root, 102).map(p => p.pid)).toEqual([102, 103]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('launch snapshots find new owned descendants without browser.process()', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
+  proc(root, 100, 1, 'node\0server.js');
+  proc(root, 101, 100, '/usr/bin/existing-helper');
+  const before = snapshotOwnedProcessDescendants(100, root);
+  proc(root, 102, 100, '/opt/custom/browser-enterprise');
+  proc(root, 103, 102, 'GeckoChildProcess\0-contentproc');
+  const seen = new Set(before.map(p => `${p.pid}:${p.startTime}`));
+  const launched = snapshotOwnedProcessDescendants(100, root)
+    .filter(p => !seen.has(`${p.pid}:${p.startTime}`));
+
+  expect(launched.map(p => p.pid)).toEqual([102, 103]);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -121,4 +137,8 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(survivorCleanup).toContain('signalOwnedProcess(');
   expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
   expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
+  expect(source).toContain('snapshotOwnedProcessDescendants(process.pid)');
+  expect(source).toMatch(/candidateBrowser\.close = async[\s\S]*?finally/);
+  expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*server\.close/);
+  expect(source).toMatch(/if \(tabAdmission\.closed\)[\s\S]*tab_admission_shutting_down[\s\S]*virtualDisplay = localVirtualDisplay/);
 });
