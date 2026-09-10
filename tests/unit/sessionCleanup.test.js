@@ -8,6 +8,28 @@
  * 4. Session expiry sets _closing before teardown
  */
 
+import { detachSessionForClose } from '../../lib/tab-admission.js';
+
+describe('session close registry detachment', () => {
+  test('detaches the exact session before asynchronous context cleanup settles', () => {
+    const session = { _closing: false };
+    const sessions = new Map([['internal-user', session]]);
+
+    expect(detachSessionForClose(sessions, 'internal-user', session)).toBe(true);
+    expect(session._closing).toBe(true);
+    expect(sessions.has('internal-user')).toBe(false);
+  });
+
+  test('never deletes a replacement session installed under the same user key', () => {
+    const stale = { _closing: true };
+    const replacement = { _closing: false };
+    const sessions = new Map([['internal-user', replacement]]);
+
+    expect(detachSessionForClose(sessions, 'internal-user', stale)).toBe(false);
+    expect(sessions.get('internal-user')).toBe(replacement);
+  });
+});
+
 describe('session cleanup after tab reaper', () => {
   // Simulate the reaper loop logic from server.js (with _closing flag)
   function runTabReaper({ sessions, TAB_INACTIVITY_MS, destroyTab, onSessionEmpty }) {
