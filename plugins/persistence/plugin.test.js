@@ -148,6 +148,44 @@ describe('persistence plugin', () => {
     expect(contextB.storageState).toHaveBeenCalledTimes(1);
   });
 
+  test('late checkpoint from replaced context cannot overwrite replacement state', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseOld, markOldStarted;
+    const oldStarted = new Promise((resolve) => { markOldStarted = resolve; });
+    const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+    const contextA = {
+      storageState: jest.fn(async ({ path: p }) => {
+        markOldStarted();
+        await oldGate;
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'stale-a' }], origins: [] }));
+      }),
+    };
+    const contextB = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'current-b' }], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextA });
+    const oldCheckpoint = events.emitAsync('session:cookies:import', {
+      userId: 'race-user',
+      context: contextA,
+    });
+    await oldStarted;
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextB });
+    await events.emitAsync('session:cookies:import', {
+      userId: 'race-user',
+      context: contextB,
+    });
+    releaseOld();
+    await oldCheckpoint;
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'race-user');
+    const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(saved.cookies[0].name).toBe('current-b');
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;

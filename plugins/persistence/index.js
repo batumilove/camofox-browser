@@ -54,7 +54,13 @@ export async function register(app, ctx, pluginConfig = {}) {
    */
   async function checkpoint(userId, context, reason) {
     if (!context) return;
-    const result = await persistStorageState({ profileDir, userId, context, logger });
+    const result = await persistStorageState({
+      profileDir,
+      userId,
+      context,
+      logger,
+      shouldPublish: () => activeSessions.get(userId) === context,
+    });
     if (result.persisted) {
       log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
     }
@@ -110,11 +116,5 @@ export async function register(app, ctx, pluginConfig = {}) {
     if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
   });
 
-  // On shutdown: checkpoint all remaining sessions
-  events.on('server:shutdown', async () => {
-    for (const [userId, context] of activeSessions) {
-      await checkpoint(userId, context, 'shutdown').catch(() => {});
-    }
-    activeSessions.clear();
-  });
+  // Shutdown checkpoints are owned by session:destroying while contexts are alive.
 }

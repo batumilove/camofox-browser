@@ -9,6 +9,7 @@ import {
   reservePendingTabCreation,
   runBoundedSessionTeardown,
   sendTabAdmissionError,
+  settleAllConcurrently,
   settleWithin,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
@@ -372,6 +373,29 @@ describe('awaitAbortableResource', () => {
 });
 
 describe('bounded timeout cleanup helpers', () => {
+  test('starts every session teardown concurrently', async () => {
+    const first = deferred();
+    const second = deferred();
+    const started = [];
+    const work = settleAllConcurrently([
+      ['first', first],
+      ['second', second],
+    ], async ([name, gate]) => {
+      started.push(name);
+      await gate.promise;
+      return name;
+    });
+
+    await flush();
+    expect(started).toEqual(['first', 'second']);
+    first.resolve();
+    second.resolve();
+    await expect(work).resolves.toEqual([
+      expect.objectContaining({ status: 'fulfilled', value: 'first' }),
+      expect.objectContaining({ status: 'fulfilled', value: 'second' }),
+    ]);
+  });
+
   test('continues teardown after hung steps and synchronous close failure', async () => {
     jest.useFakeTimers();
     try {

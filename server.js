@@ -50,6 +50,8 @@ import {
   reservePendingTabCreation,
   runBoundedSessionTeardown,
   sendTabAdmissionError,
+  settleAllConcurrently,
+  settleWithin,
   withAbortableResource,
 } from './lib/tab-admission.js';
 
@@ -5263,8 +5265,12 @@ setInterval(() => {
       session._closing = true;
       const idleMs = now - session.lastAccess;
       sessionsExpiredTotal.inc();
-      pluginEvents.emit('session:expired', { userId, idleMs });
-      closeSession(userId, session, { reason: 'session_timeout', clearDownloads: true, clearLocks: true }).catch(() => {});
+      void settleWithin(
+        pluginEvents.emitAsyncSettled('session:expired', { userId, idleMs }),
+        2000,
+      ).finally(() => {
+        closeSession(userId, session, { reason: 'session_timeout', clearDownloads: true, clearLocks: true }).catch(() => {});
+      });
       log('info', 'session expired', { userId });
     }
   }
@@ -6302,7 +6308,6 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log('info', 'shutting down', { signal });
-  pluginEvents.emit('server:shutdown', { signal });
 
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
@@ -6312,6 +6317,13 @@ async function gracefulShutdown(signal) {
 
   server.close();
   stopMemoryReporter();
+
+  await settleWithin(
+    pluginEvents.emitAsyncSettled('server:shutdown', { signal }, (err) => {
+      log('warn', 'server:shutdown plugin failed', { signal, error: err?.message || String(err) });
+    }),
+    2000,
+  );
 
   await closeAllSessions(`shutdown:${signal}`, {
     clearDownloads: false,

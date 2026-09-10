@@ -115,41 +115,22 @@ describe('profile persistence helpers', () => {
     expect(leftovers).toEqual([]);
   });
 
-  test('revalidates generation immediately before synchronous publication', async () => {
-    const original = {
-      cookies: [{ name: 'current', value: 'v1', domain: '.example.com', path: '/' }],
-      origins: [],
-    };
-    const stale = {
-      cookies: [{ name: 'stale', value: 'v0', domain: '.example.com', path: '/' }],
-      origins: [],
-    };
-    const writeState = (state) => ({
-      storageState: jest.fn(async ({ path: targetPath }) => {
-        await fs.writeFile(targetPath, JSON.stringify(state));
-      }),
-    });
-
-    await persistStorageState({
-      profileDir: tmpDir,
-      userId: 'generation-user',
-      context: writeState(original),
-    });
-
-    let generation = 1;
-    const result = await persistStorageState({
-      profileDir: tmpDir,
-      userId: 'generation-user',
-      context: writeState(stale),
-      shouldPublish: () => generation === 1,
-      beforePublish: () => { generation = 2; },
-    });
-
-    expect(result).toEqual({ persisted: false, reason: 'superseded' });
-    const { userDir, storageStatePath } = getUserPersistencePaths(tmpDir, 'generation-user');
-    const published = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
-    expect(published.cookies[0].name).toBe('current');
-    const leftovers = (await fs.readdir(userDir)).filter((name) => name.includes('.tmp-'));
-    expect(leftovers).toEqual([]);
+  test('concurrent checkpoints use collision-free temporary paths', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1234567890);
+    try {
+      const context = (name) => ({
+        storageState: jest.fn(async ({ path: targetPath }) => {
+          await fs.writeFile(targetPath, JSON.stringify({ cookies: [{ name }], origins: [] }));
+        }),
+      });
+      const [first, second] = await Promise.all([
+        persistStorageState({ profileDir: tmpDir, userId: 'same-ms', context: context('first') }),
+        persistStorageState({ profileDir: tmpDir, userId: 'same-ms', context: context('second') }),
+      ]);
+      expect(first.persisted).toBe(true);
+      expect(second.persisted).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
