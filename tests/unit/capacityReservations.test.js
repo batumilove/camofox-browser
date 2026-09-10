@@ -49,5 +49,11 @@ describe('capacity reservations', () => {
     }
     const popupHandler = source.match(/function attachPopupHandler[\s\S]*?\n}\n/)?.[0] ?? '';
     expect(popupHandler).toContain('capacityReservations.reserveTab(');
+    const googleRotation = source.match(/async function rotateGoogleTab[\s\S]*?\n}\n/)?.[0] ?? '';
+    expect(googleRotation).toContain('reserveTabCreation(');
+    expect(source).toMatch(/const recreateTabOnFreshContext[\s\S]*?reserveTabCreation\(userId, session, req\.reqId\)/);
+    expect(source).toMatch(/withTabLock\(req\.params\.tabId, \(\) => rotateGoogleTab\(/);
+    expect(source).not.toMatch(/async function destroySession[\s\S]*?sessions\.delete\(key\)[\s\S]*?closeSession\(/);
+    expect(source).toMatch(/if \(session\._closing\)[\s\S]*?code: 'session_closing'/);
   });
 });

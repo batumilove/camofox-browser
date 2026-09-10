@@ -201,6 +201,7 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(launchFailureCleanup).not.toContain('snapshotOwnedProcessTreesByExecutable(');
   expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
   expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
+  expect(source).toMatch(/refreshOwnedProcessSnapshot\(_ownedBrowserProcesses\)[\s\S]*?\.\.\.exactRootProcesses/);
   expect(source).toContain('snapshotOwnedProcessTreesByExecutable(');
   expect(source).toContain('VirtualDisplay: DefaultVirtualDisplay');
   expect(source).toMatch(/candidateBrowser\.close = async[\s\S]*?finally/);

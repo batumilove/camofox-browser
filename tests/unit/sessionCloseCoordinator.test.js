@@ -48,6 +48,11 @@ describe('session close coordination', () => {
     expect(serverSrc).toContain("from './lib/session-close.js'");
     expect(serverSrc).toMatch(/sessionCloseCoordinator\.close\(/);
     expect(serverSrc).toMatch(/try \{\s*await sessionCloseCoordinator\.close[\s\S]*?finally \{[\s\S]*?sessions\.delete\(key\)/);
+    const closeSession = serverSrc.match(/async function closeSession[\s\S]*?\n}\n/)?.[0] ?? '';
+    const closingIndex = closeSession.indexOf('session._closing = true');
+    const cleanupAwaitIndex = closeSession.indexOf('await clearSessionDownloads');
+    expect(closingIndex).toBeGreaterThanOrEqual(0);
+    expect(cleanupAwaitIndex).toBeGreaterThan(closingIndex);
   });
 
   test('legacy tab operations refresh session access time', () => {

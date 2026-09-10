@@ -1045,9 +1045,13 @@ async function _closeBrowserFullyImpl(reason) {
   const exactRootProcesses = pid
     ? snapshotOwnedBrowserProcesses(process.pid, '/proc', pid)
     : [];
-  const ownedBrowserProcesses = exactRootProcesses.length > 0
-    ? exactRootProcesses
-    : refreshOwnedProcessSnapshot(_ownedBrowserProcesses);
+  // Merge the fresh rooted tree with every exact captured identity that still
+  // exists. A child may already be reparented while the root remains attached;
+  // choosing only the fresh tree would silently drop that owned survivor.
+  const ownedBrowserProcesses = [...new Map([
+    ...refreshOwnedProcessSnapshot(_ownedBrowserProcesses),
+    ...exactRootProcesses,
+  ].map(proc => [`${proc.pid}:${proc.startTime}`, proc])).values()];
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
 
@@ -1406,6 +1410,9 @@ async function closeSession(userId, session, {
   if (!session) return;
 
   const key = normalizeUserId(userId);
+  // Publish the closing state before any cleanup await so getSession cannot
+  // hand out a context whose teardown has already begun.
+  session._closing = true;
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
@@ -1417,7 +1424,6 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  session._closing = true;
   try {
     await sessionCloseCoordinator.close(session, {
     emitDestroying: () => pluginEvents.emitAsync('session:destroying', {
@@ -1470,8 +1476,12 @@ async function getSession(userId, { trace = false } = {}) {
   // Check if existing session's context is still alive
   if (session) {
     if (session._closing) {
-      // Session is being torn down by reaper/expiry -- treat as dead
-      session = null;
+      // Never replace a same-key session while its context still consumes
+      // capacity; doing so would hide it behind sessions.set(key, created).
+      throw Object.assign(new Error('Session is closing — retry shortly'), {
+        statusCode: 503,
+        code: 'session_closing',
+      });
     } else {
       try {
         // Lightweight probe: pages() is synchronous-ish and throws if context is dead
@@ -1871,7 +1881,6 @@ async function destroySession(userId, { reason = 'destroy_session' } = {}) {
   const session = sessions.get(key);
   if (!session) return false;
   log('warn', 'destroying session', { userId: key, reason });
-  sessions.delete(key);
   deleteUserNavHealth(key);
   await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
   return true;
@@ -2165,13 +2174,21 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   }
   const session = await getSession(userId);
   const group = getTabGroup(session, sessionKey);
-  const { page, lease } = await createLeasedPage(session);
-  const tabState = createTabState(page);
-  tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
-  tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
-  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-  group.set(tabId, tabState);
-  releasePageLease(session, lease);
+  const releaseReservation = await reserveTabCreation(userId, session, reqId);
+  let page;
+  let tabState;
+  try {
+    const created = await createLeasedPage(session);
+    page = created.page;
+    tabState = createTabState(page);
+    tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
+    tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
+    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+    group.set(tabId, tabState);
+    releasePageLease(session, created.lease);
+  } finally {
+    releaseReservation();
+  }
   attachPopupHandler(page, userId, sessionKey);
   refreshActiveTabsGauge();
 
@@ -3519,12 +3536,19 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           }
           session = await getSession(userId);
           const group = getTabGroup(session, currentSessionKey);
-          const { page, lease } = await createLeasedPage(session);
-          tabState = createTabState(page);
-          tabState.googleRetryCount = previousRetryCount + 1;
-          attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-          group.set(tabId, tabState);
-          releasePageLease(session, lease);
+          const releaseReservation = await reserveTabCreation(userId, session, req.reqId);
+          let page;
+          try {
+            const created = await createLeasedPage(session);
+            page = created.page;
+            tabState = createTabState(page);
+            tabState.googleRetryCount = previousRetryCount + 1;
+            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+            group.set(tabId, tabState);
+            releasePageLease(session, created.lease);
+          } finally {
+            releaseReservation();
+          }
           attachPopupHandler(page, userId, currentSessionKey);
           refreshActiveTabsGauge();
         };
@@ -3764,7 +3788,14 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
         const blocked = await isGoogleSearchBlocked(tabState.page);
         const unavailable = !blocked && await isGoogleUnavailable(tabState.page);
         if (blocked || unavailable) {
-          const rotated = await rotateGoogleTab(userId, found.listItemId, req.params.tabId, tabState, blocked ? 'google_search_block_snapshot' : 'google_search_unavailable_snapshot', req.reqId);
+          const rotated = await withTabLock(req.params.tabId, () => rotateGoogleTab(
+            userId,
+            found.listItemId,
+            req.params.tabId,
+            tabState,
+            blocked ? 'google_search_block_snapshot' : 'google_search_unavailable_snapshot',
+            req.reqId,
+          ));
           if (rotated) {
             tabState.page = rotated.tabState.page;
             tabState.refs = rotated.tabState.refs;
