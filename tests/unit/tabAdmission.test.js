@@ -4,6 +4,8 @@ import {
   TabCapacityReservations,
   awaitAbortableResource,
   canReapEmptySession,
+  closePageWithin,
+  replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
@@ -339,5 +341,69 @@ describe('awaitAbortableResource', () => {
     await expect(result).rejects.toThrow('page closed');
     expect(registered.size).toBe(0);
     expect(close).toHaveBeenCalledWith(resource);
+  });
+});
+
+describe('bounded timeout cleanup helpers', () => {
+  test('a hung page close is attempted once and returns at the cleanup deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      const page = {
+        isClosed: jest.fn(() => false),
+        close: jest.fn(() => new Promise(() => {})),
+        removeAllListeners: jest.fn(),
+      };
+      const onFailure = jest.fn();
+      const closing = closePageWithin(page, { timeoutMs: 25, onFailure });
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(closing).resolves.toBe(false);
+      expect(page.close).toHaveBeenCalledTimes(1);
+      expect(page.removeAllListeners).toHaveBeenCalledTimes(1);
+      expect(onFailure).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('proxy retry closes only the captured failed session, never its replacement', async () => {
+    const failedSession = { name: 'A', closed: false };
+    const replacementSession = { name: 'B', closed: false };
+    const sessions = new Map([['user', replacementSession]]);
+    const closeSession = jest.fn(async (key, session) => {
+      session.closed = true;
+      if (sessions.get(key) === session) sessions.delete(key);
+    });
+    const getSession = jest.fn(async () => sessions.get('user'));
+
+    const result = await replaceSessionAfterProxyFailure({
+      signal: new AbortController().signal,
+      userKey: 'user',
+      failedSession,
+      closeSession,
+      getSession,
+    });
+
+    expect(result).toBe(replacementSession);
+    expect(closeSession).toHaveBeenCalledWith('user', failedSession);
+    expect(failedSession.closed).toBe(true);
+    expect(replacementSession.closed).toBe(false);
+  });
+
+  test('proxy retry cannot rotate after its admission operation is aborted', async () => {
+    const controller = new AbortController();
+    const reason = new Error('timed out');
+    controller.abort(reason);
+    const closeSession = jest.fn();
+    const getSession = jest.fn();
+
+    await expect(replaceSessionAfterProxyFailure({
+      signal: controller.signal,
+      userKey: 'user',
+      failedSession: {},
+      closeSession,
+      getSession,
+    })).rejects.toBe(reason);
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(getSession).not.toHaveBeenCalled();
   });
 });
