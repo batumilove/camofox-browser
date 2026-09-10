@@ -1231,7 +1231,12 @@ async function launchBrowserInstance() {
         snapshotOwnedProcessDescendants(process.pid).map(proc => `${proc.pid}:${proc.startTime}`),
       );
       candidateBrowser = await firefox.launch(options);
-      candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)
+      candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(
+        process.pid,
+        browserExecutablePath,
+        '/proc',
+        launchBaseline,
+      )
         .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
       if (os.platform() === 'linux' && candidateOwnedProcesses.length === 0) {
         throw new Error(`Unable to identify launched browser process tree for ${browserExecutablePath}`);
@@ -1297,7 +1302,12 @@ async function launchBrowserInstance() {
       });
       await candidateBrowser?.close().catch(() => {});
       if (launchBaseline) {
-        candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)
+        candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(
+          process.pid,
+          browserExecutablePath,
+          '/proc',
+          launchBaseline,
+        )
           .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
       }
       await _forceKillBrowserProcesses('launch_attempt_failed', candidateOwnedProcesses);

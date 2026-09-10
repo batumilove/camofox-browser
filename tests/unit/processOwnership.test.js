@@ -77,6 +77,41 @@ test('launch snapshots include only the exact executable tree, not concurrent he
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('launch snapshots exclude new children of a pre-existing matching tree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
+  proc(root, 100, 1, 'node\0server.js');
+  proc(root, 101, 100, '/opt/custom/browser-enterprise', '10');
+  const baseline = new Set(['101:10']);
+  proc(root, 102, 100, '/opt/custom/browser-enterprise', '20');
+  proc(root, 103, 102, 'GeckoChildProcess\0-contentproc', '30');
+  proc(root, 104, 101, 'GeckoChildProcess\0-contentproc', '40');
+
+  const launched = snapshotOwnedProcessTreesByExecutable(
+    100,
+    '/opt/custom/browser-enterprise',
+    root,
+    baseline,
+  );
+
+  expect(launched.map(p => p.pid)).toEqual([102, 103]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('launch snapshots fail closed for concurrent same-executable roots', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
+  proc(root, 100, 1, 'node\0server.js');
+  proc(root, 101, 100, '/opt/custom/browser-enterprise', '10');
+  proc(root, 102, 100, '/opt/custom/browser-enterprise', '20');
+
+  expect(snapshotOwnedProcessTreesByExecutable(
+    100,
+    '/opt/custom/browser-enterprise',
+    root,
+    new Set(),
+  )).toEqual([]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('owned-process termination escalates TERM survivors with generation-safe signaling', () => {
   const identity = { pid: 101, startTime: '10' };
   const signals = [];
@@ -161,7 +196,7 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(survivorCleanup).toContain('signalOwnedProcess(');
   expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
   expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
-  expect(source).toContain('snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)');
+  expect(source).toContain('snapshotOwnedProcessTreesByExecutable(');
   expect(source).toContain('VirtualDisplay: DefaultVirtualDisplay');
   expect(source).toMatch(/candidateBrowser\.close = async[\s\S]*?finally/);
   expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*server\.close/);
