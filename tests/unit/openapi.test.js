@@ -189,6 +189,14 @@ describe('OpenAPI spec', () => {
     }));
     expect(schema.properties.admission.properties).not.toHaveProperty('activeGlobal');
     expect(schema.properties.admission.properties).not.toHaveProperty('pendingGlobal');
+    expect(schema.properties.session.properties.idleMs.maximum).toBe(1_000_000_000);
+    expect(schema.properties.session.properties.pendingTabCreations.maximum).toBe(1_000_000_000);
+    expect(schema.properties.session.properties.tabCount.maximum).toBe(1_000_000_000);
+    expect(schema.properties.concurrency.properties.activeForUser.maximum).toBe(1_000_000_000);
+    expect(schema.properties.concurrency.properties.queuedForUser.maximum).toBe(1_000_000_000);
+    expect(schema.properties.locks.properties.activeForUser.maximum).toBe(1_000_000_000);
+    expect(schema.properties.locks.properties.queuedForUser.maximum).toBe(1_000_000_000);
+    expect(schema.properties.tabs.items.properties.lock.properties.queued.maximum).toBe(1_000_000_000);
     expect(schema.properties.tabs.items.properties.toolCalls.maximum).toBe(1_000_000_000);
     expect(schema.properties.tabs.items.properties.consecutiveTimeouts.maximum).toBe(1_000_000_000);
     expect(schema.properties.tabs.items.properties.consecutiveFailures.maximum).toBe(1_000_000_000);

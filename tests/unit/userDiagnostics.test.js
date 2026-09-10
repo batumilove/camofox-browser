@@ -88,7 +88,7 @@ describe('collectUserDiagnostics', () => {
     hugeQueue.length = 1_000_000_001;
     const result = collectUserDiagnostics({
       userId: 'bounded-user',
-      now: 2_000,
+      now: Number.MAX_SAFE_INTEGER,
       sessions: new Map([['bounded-user', session([
         ['bounded-session', new Map([['bounded-tab', tabState({
           toolCalls: Number.MAX_SAFE_INTEGER,
@@ -105,6 +105,7 @@ describe('collectUserDiagnostics', () => {
     });
 
     expect(result.userId).toBe('bounded-user');
+    expect(result.session.idleMs).toBe(1_000_000_000);
     expect(result.session.pendingTabCreations).toBe(1_000_000_000);
     expect(result.admission.activeForUser).toBe(1_000_000_000);
     expect(result.admission.pendingForUser).toBe(1_000_000_000);

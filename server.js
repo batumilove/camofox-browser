@@ -5146,17 +5146,66 @@ app.delete('/sessions/:userId', authMiddleware(), async (req, res) => {
  *           application/json:
  *             schema:
  *               type: object
+ *               additionalProperties: false
  *               required: [userId, generatedAt, session, admission, concurrency, locks, tabs]
  *               properties:
  *                 userId: { type: string }
  *                 generatedAt: { type: integer }
- *                 session: { type: object }
- *                 admission: { type: object }
- *                 concurrency: { type: object }
- *                 locks: { type: object }
+ *                 session:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [exists, closing, lastAccess, idleMs, pendingTabCreations, tabCount, sessionKeys]
+ *                   properties:
+ *                     exists: { type: boolean }
+ *                     closing: { type: boolean }
+ *                     lastAccess: { type: integer, nullable: true }
+ *                     idleMs: { type: integer, minimum: 0, maximum: 1000000000, nullable: true }
+ *                     pendingTabCreations: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     tabCount: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     sessionKeys:
+ *                       type: array
+ *                       items: { type: string }
+ *                 admission:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, pendingForUser, activeWithoutSession]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     pendingForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     activeWithoutSession: { type: boolean }
+ *                 concurrency:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, queuedForUser]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     queuedForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                 locks:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, queuedForUser]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     queuedForUser: { type: integer, minimum: 0, maximum: 1000000000 }
  *                 tabs:
  *                   type: array
- *                   items: { type: object }
+ *                   items:
+ *                     type: object
+ *                     additionalProperties: false
+ *                     required: [tabId, sessionKey, lock, toolCalls, consecutiveTimeouts, consecutiveFailures]
+ *                     properties:
+ *                       tabId: { type: string }
+ *                       sessionKey: { type: string }
+ *                       lock:
+ *                         type: object
+ *                         additionalProperties: false
+ *                         required: [active, queued]
+ *                         properties:
+ *                           active: { type: boolean }
+ *                           queued: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       toolCalls: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       consecutiveTimeouts: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       consecutiveFailures: { type: integer, minimum: 0, maximum: 1000000000 }
  *       403:
  *         description: Authentication required.
  *         content:
