@@ -29,6 +29,7 @@
  */
 
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import {
   getUserPersistencePaths,
   loadPersistedStorageState,
@@ -44,6 +45,24 @@ async function removeIfExists(p) {
     if (err?.code === 'ENOENT') return false;
     throw err;
   }
+}
+
+async function removeStorageStateArtifacts({ userDir, storageStatePath, metaPath }) {
+  const removedPersisted = await removeIfExists(storageStatePath);
+  await removeIfExists(metaPath);
+
+  let names;
+  try {
+    names = await fs.readdir(userDir);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return removedPersisted;
+    throw err;
+  }
+  const temporarySnapshot = /^(?:storage-state|meta)\.json\.tmp-\d+-\d+$/;
+  await Promise.all(names
+    .filter(name => temporarySnapshot.test(name))
+    .map(name => removeIfExists(path.join(userDir, name))));
+  return removedPersisted;
 }
 
 export async function register(app, ctx, pluginConfig = {}) {
@@ -229,14 +248,13 @@ export async function register(app, ctx, pluginConfig = {}) {
 
     resettingUsers.add(userId);
     try {
-      const { storageStatePath, metaPath } = getUserPersistencePaths(profileDir, userId);
+      const paths = getUserPersistencePaths(profileDir, userId);
       let removedPersisted = false;
       const reset = await ctx.resetSession(userId, {
         reason: 'storage_reset',
         whileBlocked: async () => {
           await checkpointPromises.get(userId)?.catch(() => {});
-          removedPersisted = await removeIfExists(storageStatePath);
-          await removeIfExists(metaPath);
+          removedPersisted = await removeStorageStateArtifacts(paths);
         },
       });
       const clearedLive = reset.hadLive || reset.hadCreation;

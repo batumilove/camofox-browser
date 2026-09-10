@@ -229,6 +229,46 @@ describe('persistence plugin', () => {
     });
   });
 
+  test('DELETE storage_state removes crash-stranded snapshot temp files for that user', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const handler = mockApp.delete.mock.calls
+      .find(c => c[0] === '/sessions/:userId/storage_state')
+      .at(-1);
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { userDir, storageStatePath, metaPath } = getUserPersistencePaths(tmpDir, 'temp-user');
+    await fs.mkdir(userDir, { recursive: true });
+    const stranded = [
+      `${storageStatePath}.tmp-999-1`,
+      `${metaPath}.tmp-999-1`,
+    ];
+    await Promise.all(stranded.map(file => fs.writeFile(file, 'sensitive partial snapshot')));
+
+    const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
+    await handler({ params: { userId: 'temp-user' } }, res);
+
+    for (const file of stranded) {
+      await expect(fs.access(file)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+  });
+
+  test('DELETE storage_state is protected by the configured auth middleware', async () => {
+    const authMiddleware = jest.fn((req, res) => res.status(401).json({ error: 'Unauthorized' }));
+    ctx.auth = jest.fn(() => authMiddleware);
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const call = mockApp.delete.mock.calls.find(c => c[0] === '/sessions/:userId/storage_state');
+    expect(ctx.auth).toHaveBeenCalledTimes(1);
+    expect(call).toHaveLength(3);
+
+    const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
+    const next = jest.fn();
+    await call[1]({ params: { userId: 'protected-user' } }, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+    expect(ctx.resetSession).not.toHaveBeenCalled();
+  });
+
   test('DELETE storage_state waits for an in-flight checkpoint before deleting', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
     const handler = mockApp.delete.mock.calls

@@ -4,9 +4,13 @@ const { join } = process.getBuiltinModule('path');
 const read = path => readFileSync(join(process.cwd(), path), 'utf8');
 
 describe('browser creation ownership source contract', () => {
-  test('server and plugins do not call raw Playwright context/page factories', () => {
+  test('server and plugins isolate raw Playwright context/page factories behind ownership wrappers', () => {
+    const server = read('server.js');
+    expect(server).not.toMatch(/\.newContext\s*\(/);
+    expect(server.match(/\.newPage\s*\(/g)).toHaveLength(1);
+    expect(server).toContain('async function createLeasedPage(session)');
+
     const guarded = [
-      'server.js',
       'plugins/youtube/index.js',
       'plugins/persistence/index.js',
     ];
@@ -33,7 +37,8 @@ describe('browser creation ownership source contract', () => {
 
   test('managed removal paths transfer failed closes to owned cleanup', () => {
     const server = read('server.js');
-    expect(server).toContain("cleanup: page => closeOwnedPage(page, 'tab_creation_abort', effectiveSession)");
+    expect(server).toContain("await closeOwnedPage(resource.page, 'tab_creation_abort', effectiveSession)");
+    expect(server).toContain('releasePageLease(effectiveSession, resource.lease)');
     expect(server).toContain("await closeOwnedPage(found.tabState.page, 'tab_delete', session)");
     expect(server).toContain("await closeOwnedPage(tabState.page, 'tab_group_delete', session)");
     expect(server).toContain("void closeOwnedPage(tabState.page, 'tab_inactivity_reaper', session)");
@@ -64,6 +69,18 @@ describe('browser creation ownership source contract', () => {
     expect(server).toContain("raw page creation ownership retained after unverified teardown");
     expect(server).toContain('scheduleSessionCloseRetry(userId, session, options)');
     expect(server).toContain('closingSessions.delete(session)');
+  });
+
+  test('graceful shutdown closes session creation before snapshotting published sessions', () => {
+    const server = read('server.js');
+    const shutdownStart = server.indexOf('async function gracefulShutdown');
+    const shutdownEnd = server.indexOf("process.on('SIGTERM'", shutdownStart);
+    const shutdownSection = server.slice(shutdownStart, shutdownEnd);
+    const creationBarrier = shutdownSection.indexOf('await sessionCreationCoordinator.shutdown(');
+    const sessionSnapshot = shutdownSection.indexOf('await closeAllSessions(');
+
+    expect(creationBarrier).toBeGreaterThan(-1);
+    expect(sessionSnapshot).toBeGreaterThan(creationBarrier);
   });
 
   test('popup adoption is bound to its originating context and generation', () => {

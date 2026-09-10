@@ -51,7 +51,7 @@ describe('launch compatibility source contract', () => {
 
   test('uses a real desktop window only when interactive desktop mode is explicit', () => {
     const launch = sourceBetween(
-      'async function launchBrowserInstance()',
+      'async function launchBrowserInstance(',
       'async function ensureBrowser()'
     );
 
@@ -62,8 +62,8 @@ describe('launch compatibility source contract', () => {
 
   test('health probe context also uses a null viewport', () => {
     const healthProbeOptions = sourceBetween(
-      'testContext = await browser.newContext(',
-      'const page = await testContext.newPage();'
+      "ownerKey: '__health_probe__'",
+      "label: 'health_probe'"
     );
 
     expect(healthProbeOptions).toContain('viewport: null');

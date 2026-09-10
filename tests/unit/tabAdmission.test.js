@@ -109,6 +109,51 @@ describe('TabAdmissionController', () => {
     await run3;
   });
 
+  test('bounds pending work per user so one caller cannot monopolize the global queue', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 4,
+      maxPendingPerUser: 2,
+    });
+    const active = deferred();
+    const queued1 = deferred();
+    const queued2 = deferred();
+    const overflow = deferred();
+    const runs = [
+      controller.run('monopolizer', () => active.promise),
+      controller.run('monopolizer', () => queued1.promise),
+      controller.run('monopolizer', () => queued2.promise),
+      controller.run('monopolizer', () => overflow.promise),
+    ];
+    runs.forEach(run => run.catch(() => {}));
+
+    try {
+      await flush();
+      expect(controller.snapshot()).toMatchObject({
+        active: 1,
+        pending: 2,
+        pendingByUser: { monopolizer: 2 },
+      });
+      await expect(runs[3]).rejects.toMatchObject({
+        statusCode: 429,
+        code: 'tab_admission_user_queue_full',
+      });
+
+      const other = deferred();
+      const otherRun = controller.run('other-user', () => other.promise);
+      otherRun.catch(() => {});
+      expect(controller.snapshot()).toMatchObject({ pending: 3 });
+      other.resolve('other');
+    } finally {
+      active.resolve('active');
+      queued1.resolve('queued-1');
+      queued2.resolve('queued-2');
+      overflow.resolve('unexpected');
+      await Promise.allSettled(runs);
+    }
+  });
+
   test.each([
     ['success', async () => 'ok'],
     ['error', async () => { throw new Error('boom'); }],
@@ -278,6 +323,36 @@ describe('RawCreationRegistry', () => {
       expect(registry.snapshot().outstanding).toBe(1);
       expect(() => registry.acquire({ userKey: 'u2', kind: 'page', deadlineMs: 50 }))
         .toThrow(expect.objectContaining({ code: 'tab_admission_raw_creation_limit' }));
+      lease.settle();
+      expect(registry.snapshot().outstanding).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('retries a rejected deadline handler without releasing raw-creation ownership', async () => {
+    jest.useFakeTimers();
+    try {
+      const onDeadline = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('transient teardown failure'))
+        .mockResolvedValueOnce(undefined);
+      const registry = new RawCreationRegistry({
+        maxOutstanding: 1,
+        maxPerUser: 1,
+        onDeadline,
+        deadlineRetryMs: 25,
+      });
+      const lease = registry.acquire({ userKey: 'u1', kind: 'page', deadlineMs: 10 });
+
+      await jest.advanceTimersByTimeAsync(10);
+      expect(onDeadline).toHaveBeenCalledTimes(1);
+      expect(registry.snapshot().outstanding).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(25);
+      expect(onDeadline).toHaveBeenCalledTimes(2);
+      expect(registry.snapshot().outstanding).toBe(1);
+
       lease.settle();
       expect(registry.snapshot().outstanding).toBe(0);
     } finally {

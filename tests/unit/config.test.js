@@ -111,6 +111,7 @@ describe('loadConfig', () => {
     process.env.TAB_ADMISSION_MAX_ACTIVE = '0';
     process.env.TAB_ADMISSION_MAX_ACTIVE_PER_USER = '-2';
     process.env.TAB_ADMISSION_QUEUE_LIMIT = 'NaN';
+    process.env.TAB_ADMISSION_QUEUE_LIMIT_PER_USER = '0';
 
     const config = loadConfig();
 
@@ -121,6 +122,7 @@ describe('loadConfig', () => {
     expect(config.tabAdmissionMaxActive).toBe(4);
     expect(config.tabAdmissionMaxActivePerUser).toBe(2);
     expect(config.tabAdmissionQueueLimit).toBe(8);
+    expect(config.tabAdmissionQueueLimitPerUser).toBe(4);
   });
 
   test('accepts positive admission-control values', () => {
@@ -131,6 +133,7 @@ describe('loadConfig', () => {
     process.env.TAB_ADMISSION_MAX_ACTIVE = '6';
     process.env.TAB_ADMISSION_MAX_ACTIVE_PER_USER = '3';
     process.env.TAB_ADMISSION_QUEUE_LIMIT = '5';
+    process.env.TAB_ADMISSION_QUEUE_LIMIT_PER_USER = '3';
 
     const config = loadConfig();
 
@@ -141,6 +144,7 @@ describe('loadConfig', () => {
     expect(config.tabAdmissionMaxActive).toBe(6);
     expect(config.tabAdmissionMaxActivePerUser).toBe(3);
     expect(config.tabAdmissionQueueLimit).toBe(5);
+    expect(config.tabAdmissionQueueLimitPerUser).toBe(3);
     expect(config.serverEnv).toMatchObject({
       HANDLER_TIMEOUT_MS: '1500',
       MAX_CONCURRENT_PER_USER: '4',
@@ -149,7 +153,18 @@ describe('loadConfig', () => {
       TAB_ADMISSION_MAX_ACTIVE: '6',
       TAB_ADMISSION_MAX_ACTIVE_PER_USER: '3',
       TAB_ADMISSION_QUEUE_LIMIT: '5',
+      TAB_ADMISSION_QUEUE_LIMIT_PER_USER: '3',
     });
+  });
+
+  test('derives the per-user queue limit from the configured global limit', () => {
+    process.env.TAB_ADMISSION_QUEUE_LIMIT = '3';
+    delete process.env.TAB_ADMISSION_QUEUE_LIMIT_PER_USER;
+
+    expect(loadConfig().tabAdmissionQueueLimitPerUser).toBe(2);
+
+    process.env.TAB_ADMISSION_QUEUE_LIMIT_PER_USER = '9';
+    expect(loadConfig().tabAdmissionQueueLimitPerUser).toBe(3);
   });
 
   test('disables default addons when CAMOFOX_DISABLE_DEFAULT_ADDONS is set', () => {

@@ -548,6 +548,7 @@ const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const TAB_ADMISSION_MAX_ACTIVE = CONFIG.tabAdmissionMaxActive;
 const TAB_ADMISSION_MAX_ACTIVE_PER_USER = CONFIG.tabAdmissionMaxActivePerUser;
 const TAB_ADMISSION_QUEUE_LIMIT = CONFIG.tabAdmissionQueueLimit;
+const TAB_ADMISSION_QUEUE_LIMIT_PER_USER = CONFIG.tabAdmissionQueueLimitPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
@@ -856,6 +857,7 @@ const tabAdmission = new TabAdmissionController({
   maxActive: TAB_ADMISSION_MAX_ACTIVE,
   maxActivePerUser: TAB_ADMISSION_MAX_ACTIVE_PER_USER,
   maxPending: TAB_ADMISSION_QUEUE_LIMIT,
+  maxPendingPerUser: TAB_ADMISSION_QUEUE_LIMIT_PER_USER,
   waitTimeoutMs: requestTimeoutMs(),
   operationTimeoutMs: requestTimeoutMs(),
   retryAfterSeconds: 2,
@@ -7863,6 +7865,7 @@ setInterval(async () => {
     await withTemporaryBrowserPage({
       ownerKey: '__health_probe__',
       targetBrowser: probeBrowser,
+      contextOptions: { viewport: null },
       label: 'health_probe',
     }, async page => {
       await page.goto('about:blank', { timeout: 5000 });
@@ -7910,6 +7913,13 @@ async function gracefulShutdown(signal) {
 
   server.close();
   stopMemoryReporter();
+
+  const shutdownReason = Object.assign(new Error(`Server shutdown: ${signal}`), {
+    code: 'server_shutting_down',
+    statusCode: 503,
+    retryable: true,
+  });
+  await sessionCreationCoordinator.shutdown(shutdownReason);
 
   await pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
     log('error', 'server:shutdown listener failed', { error: err.message });

@@ -98,7 +98,8 @@ describe('createPageWithSessionRecovery', () => {
       reservePendingCreation,
     }));
 
-    expect(result).toEqual({ session: replacement, page });
+    expect(result).toMatchObject({ session: replacement, page });
+    expect(result.lease).toMatchObject({ page, released: false });
     expect(reservePendingCreation.mock.calls.map(([session]) => session.id)).toEqual(['old', 'replacement']);
     expect(releases).toHaveLength(2);
     expect(releases[0]).toHaveBeenCalledTimes(1);
@@ -142,7 +143,8 @@ describe('createPageWithSessionRecovery', () => {
       cleanupLatePage,
     }));
 
-    expect(result).toEqual({ session: replacement, page });
+    expect(result).toMatchObject({ session: replacement, page });
+    expect(result.lease).toMatchObject({ page, released: false });
     expect(releases.get('old')).not.toHaveBeenCalled();
     expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
     expect(rawReleases.get('old')).not.toHaveBeenCalled();
@@ -222,7 +224,7 @@ describe('createPageWithSessionRecovery', () => {
       getSession: async () => replacement,
       reservePendingCreation,
       cleanupLatePage,
-    }))).resolves.toEqual({ session: replacement, page: replacementPage });
+    }))).resolves.toMatchObject({ session: replacement, page: replacementPage });
 
     expect(releases.get('old')).not.toHaveBeenCalled();
     rejectOldPage(new Error('late context close'));

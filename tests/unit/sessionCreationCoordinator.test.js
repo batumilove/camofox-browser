@@ -311,4 +311,31 @@ describe('SessionCreationCoordinator', () => {
     await reset;
     expect(coordinator.snapshot()).toMatchObject({ inflight: 0, lifecycleKeys: 0, resetting: 0 });
   });
+
+  test('shutdown synchronously blocks new factories and invalidates in-flight creation', async () => {
+    const raw = deferred();
+    const disposeLate = jest.fn(async () => {});
+    const coordinator = new SessionCreationCoordinator({
+      maxInflight: 2,
+      settleTimeoutMs: 50,
+      disposeLate,
+    });
+    const creating = coordinator.getOrCreate('u1', async () => raw.promise);
+    creating.catch(() => {});
+    await flush();
+
+    const reason = Object.assign(new Error('server shutdown'), { code: 'server_shutting_down' });
+    const shutdown = coordinator.shutdown(reason);
+
+    const factory = jest.fn(async () => ({ id: 'must-not-publish' }));
+    await expect(coordinator.getOrCreate('u2', factory)).rejects.toBe(reason);
+    expect(factory).not.toHaveBeenCalled();
+
+    const late = { id: 'late-session' };
+    raw.resolve(late);
+    await expect(creating).rejects.toBe(reason);
+    await shutdown;
+    expect(disposeLate).toHaveBeenCalledWith(late, expect.objectContaining({ key: 'u1' }));
+    expect(coordinator.snapshot()).toMatchObject({ inflight: 0, lifecycleKeys: 0 });
+  });
 });

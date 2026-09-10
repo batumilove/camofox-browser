@@ -653,6 +653,7 @@ Browser behavior can be tuned in `camofox.config.json`:
 | `TAB_ADMISSION_MAX_ACTIVE` | Max concurrent tab creations globally | `4` |
 | `TAB_ADMISSION_MAX_ACTIVE_PER_USER` | Max concurrent tab creations per user | `2` |
 | `TAB_ADMISSION_QUEUE_LIMIT` | Max queued tab-creation requests before HTTP 429 | `8` |
+| `TAB_ADMISSION_QUEUE_LIMIT_PER_USER` | Max queued tab-creation requests per user before HTTP 429 | Half the global queue limit, rounded up (`4`) |
 | `MAX_OLD_SPACE_SIZE` | Node.js V8 heap limit (MB) | `128` |
 | `PROXY_STRATEGY` | Proxy mode: `backconnect` (rotating sticky sessions) or blank (single endpoint) | - |
 | `PROXY_PROVIDER` | Provider name for session format (e.g. `decodo`) | `decodo` |
