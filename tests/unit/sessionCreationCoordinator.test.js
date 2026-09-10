@@ -160,7 +160,9 @@ describe('SessionCreationCoordinator', () => {
         .fn()
         .mockImplementationOnce((_entry, _reason, { signal }) => {
           firstSignal = signal;
-          return new Promise(() => {});
+          return new Promise((_, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          });
         })
         .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
       const coordinator = new SessionCreationCoordinator({
@@ -186,6 +188,39 @@ describe('SessionCreationCoordinator', () => {
       await flush();
       expect(onEscalate).toHaveBeenCalledTimes(2);
       expect(coordinator.snapshot().inflight).toBe(0);
+
+      raw.reject(new Error('late owner settlement'));
+      await flush();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('retains one permanently hanging escalation without accumulating attempts', async () => {
+    jest.useFakeTimers();
+    try {
+      const raw = deferred();
+      const onEscalate = jest.fn(() => new Promise(() => {}));
+      const coordinator = new SessionCreationCoordinator({
+        maxInflight: 1,
+        settleTimeoutMs: 10,
+        escalationTimeoutMs: 10,
+        onEscalate,
+      });
+      const creating = coordinator.getOrCreate('u1', async ({ bindOwner }) => {
+        bindOwner('browser-1');
+        return raw.promise;
+      });
+      creating.catch(() => {});
+      await flush();
+
+      const invalidation = coordinator.invalidate('u1', new Error('cancelled'));
+      await jest.advanceTimersByTimeAsync(20);
+      await expect(invalidation).resolves.toBe(false);
+      await jest.advanceTimersByTimeAsync(200);
+      await flush();
+      expect(onEscalate).toHaveBeenCalledTimes(1);
+      expect(coordinator.snapshot().inflight).toBe(1);
 
       raw.reject(new Error('late owner settlement'));
       await flush();

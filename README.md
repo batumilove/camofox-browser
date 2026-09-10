@@ -98,6 +98,8 @@ npm start  # downloads Camoufox on first run (~300MB)
 
 Default port is `9377`. See [Environment Variables](#environment-variables) for all options.
 
+> **Linux prerequisite:** Python 3.9+ and a kernel with `pidfd_open`/`pidfd_send_signal` support (Linux 5.1+) are required for generation-safe forced browser cleanup. The Docker image installs `python3-minimal`; non-Docker installations must provide `python3` on `PATH`. Cleanup fails closed if pidfd support is unavailable.
+
 > **Note:** the postinstall script unsets `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` for itself before fetching the Camoufox binary. Without that override, an exported `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` (common when Playwright is configured to use system Chrome) would silently skip the binary download and crash the server at runtime.
 >
 > **External Camoufox executable:** set `CAMOUFOX_EXECUTABLE=/path/to/camoufox-bin` before `npm install` and when starting the server to skip the bundled download and launch that executable. Compatibility aliases are `CAMOUFOX_EXECUTABLE_PATH` and `CAMOFOX_EXECUTABLE_PATH`. This is useful for NixOS paths such as `/nix/store/.../camoufox-bin`; the executable must come from a Camoufox bundle that includes `properties.json`, `version.json`, and `fontconfig/`.

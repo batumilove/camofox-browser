@@ -58,6 +58,29 @@ describe('bounded resource creation', () => {
     }
   });
 
+  test('failed cleanup retains ownership of a late unadopted resource', async () => {
+    jest.useFakeTimers();
+    try {
+      const raw = deferred();
+      const settle = jest.fn();
+      const creating = createOwnedResource({
+        target: { newPage: () => raw.promise },
+        method: 'newPage',
+        timeoutMs: 10,
+        acquire: () => ({ settle }),
+        cleanup: async () => false,
+      });
+      const rejected = expect(creating).rejects.toMatchObject({ code: 'resource_creation_timeout' });
+      await jest.advanceTimersByTimeAsync(10);
+      await rejected;
+      raw.resolve({ id: 'survivor' });
+      await flush();
+      expect(settle).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('temporary resources release raw-creation ownership before bounded operation cleanup', async () => {
     const calls = [];
     const resource = { id: 'temporary' };
@@ -65,13 +88,44 @@ describe('bounded resource creation', () => {
       target: { newPage: async () => resource },
       method: 'newPage',
       acquire: () => ({ settle: () => calls.push('settle') }),
+      acquireLifetime: () => ({ settle: () => calls.push('lifetime-settle') }),
       cleanup: async value => calls.push(`cleanup:${value.id}`),
     }, async value => {
       calls.push(`operate:${value.id}`);
       return 'ok';
     });
     expect(result).toBe('ok');
-    expect(calls).toEqual(['settle', 'operate:temporary', 'cleanup:temporary']);
+    expect(calls).toEqual(['settle', 'operate:temporary', 'cleanup:temporary', 'lifetime-settle']);
+  });
+
+  test('failed temporary cleanup retains its lifetime lease', async () => {
+    const rawSettle = jest.fn();
+    const lifetimeSettle = jest.fn();
+    const cleanupError = new Error('cannot close');
+    await expect(withTemporaryResource({
+      target: { newPage: async () => ({ id: 'temporary' }) },
+      method: 'newPage',
+      acquire: () => ({ settle: rawSettle }),
+      acquireLifetime: () => ({ settle: lifetimeSettle }),
+      cleanup: async () => { throw cleanupError; },
+    }, async () => 'done')).rejects.toBe(cleanupError);
+    expect(rawSettle).toHaveBeenCalledTimes(1);
+    expect(lifetimeSettle).not.toHaveBeenCalled();
+  });
+
+  test('failed lifetime acquisition preserves raw ownership when cleanup also fails', async () => {
+    const rawSettle = jest.fn();
+    const cleanup = jest.fn(async () => false);
+    const capacityError = new Error('lifetime capacity unavailable');
+    await expect(withTemporaryResource({
+      target: { newPage: async () => ({ id: 'temporary' }) },
+      method: 'newPage',
+      acquire: () => ({ settle: rawSettle }),
+      acquireLifetime: () => { throw capacityError; },
+      cleanup,
+    }, async () => 'must-not-run')).rejects.toBe(capacityError);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(rawSettle).not.toHaveBeenCalled();
   });
 
   test('caller abort interrupts an adopted operation and starts cleanup', async () => {

@@ -10,11 +10,13 @@
  *  6. Enriched routes have proper metadata
  */
 
-import { readFileSync } from 'fs';
+import { jest } from '@jest/globals';
+import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import swaggerJsdoc from 'swagger-jsdoc';
-import { swaggerDefinition } from '../../lib/openapi.js';
+import { mountDocs, swaggerDefinition } from '../../lib/openapi.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(__dirname, '..', '..', 'server.js');
@@ -218,13 +220,40 @@ describe('OpenAPI spec', () => {
     expect(unresolved).toEqual([]);
   });
 
-  test('openapi.json in repo root is up to date', () => {
+  test('openapi.json in repo root and docs are up to date', () => {
     let committed;
+    let docsCommitted;
     try {
       committed = JSON.parse(readFileSync(join(__dirname, '..', '..', 'openapi.json'), 'utf8'));
+      docsCommitted = JSON.parse(readFileSync(join(__dirname, '..', '..', 'docs', 'openapi.json'), 'utf8'));
     } catch {
-      throw new Error('openapi.json not found -- run: npm run generate-openapi');
+      throw new Error('OpenAPI artifacts not found -- run: npm run generate-openapi');
     }
     expect(committed).toEqual(spec);
+    expect(docsCommitted).toEqual(spec);
+  });
+
+  test('mountDocs resolves route sources independently of process cwd', () => {
+    const originalCwd = process.cwd();
+    const unrelated = mkdtempSync(join(tmpdir(), 'camofox-openapi-cwd-'));
+    try {
+      process.chdir(unrelated);
+      const app = {
+        get: jest.fn(),
+        use: jest.fn(),
+      };
+      const mounted = mountDocs(app);
+      expect(Object.keys(mounted.paths || {}).length).toBeGreaterThanOrEqual(30);
+      expect(mounted.paths['/tabs']?.post).toBeDefined();
+      expect(mounted.paths['/sessions/{userId}/storage_state']?.delete).toBeDefined();
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(unrelated, { recursive: true, force: true });
+    }
+  });
+
+  test('package allowlist ships committed spec and docs assets', () => {
+    expect(pkg.files).toContain('openapi.json');
+    expect(pkg.files).toContain('docs/');
   });
 });

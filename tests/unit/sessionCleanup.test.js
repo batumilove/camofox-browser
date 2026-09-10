@@ -3,10 +3,12 @@
  *
  * Covers:
  * 1. Tab reaper → empty session cleanup (with _closing flag)
- * 2. getSession() skips sessions marked _closing
+ * 2. getSession() rejects while a closing session still owns its mapping
  * 3. YT transcript cleanup uses context.pages() instead of tabGroups
  * 4. Session expiry sets _closing before teardown
  */
+
+import { jest } from '@jest/globals';
 
 describe('session cleanup after tab reaper', () => {
   // Simulate the reaper loop logic from server.js (with _closing flag)
@@ -188,19 +190,31 @@ describe('session cleanup after tab reaper', () => {
 
 describe('getSession _closing flag handling', () => {
   // Simulate getSession logic from server.js
-  function getSession(sessions, userId, createContext) {
+  async function getSession(sessions, userId, createContext, destroySession = async (key, session) => {
+    if (sessions.get(key) === session) sessions.delete(key);
+    return { terminated: true };
+  }) {
     const key = String(userId);
     let session = sessions.get(key);
 
     if (session) {
       if (session._closing) {
-        session = null;
+        throw Object.assign(new Error('Prior session teardown is not yet verified'), {
+          statusCode: 503,
+          code: 'session_reset_incomplete',
+        });
       } else {
         try {
           session.context.pages();
         } catch {
-          sessions.delete(key);
-          session = null;
+          const proof = await destroySession(key, session);
+          if (sessions.get(key) === session || proof?.terminated !== true) {
+            throw Object.assign(new Error('Dead session teardown is not yet verified'), {
+              statusCode: 503,
+              code: 'session_reset_incomplete',
+            });
+          }
+          session = sessions.get(key) || null;
         }
       }
     }
@@ -208,51 +222,75 @@ describe('getSession _closing flag handling', () => {
     if (!session) {
       const context = createContext();
       session = { context, tabGroups: new Map(), lastAccess: Date.now() };
+      const incumbent = sessions.get(key);
+      if (incumbent && incumbent !== session) {
+        throw Object.assign(new Error('Prior session ownership is not yet retired'), {
+          statusCode: 503,
+          code: 'session_reset_incomplete',
+        });
+      }
       sessions.set(key, session);
     }
     session.lastAccess = Date.now();
     return session;
   }
 
-  test('returns existing session when context is alive', () => {
+  test('returns existing session when context is alive', async () => {
     const sessions = new Map();
     const existingContext = { pages: () => [] };
     sessions.set('user-1', { context: existingContext, tabGroups: new Map(), lastAccess: 0 });
 
-    const result = getSession(sessions, 'user-1', () => { throw new Error('should not create'); });
+    const result = await getSession(sessions, 'user-1', () => { throw new Error('should not create'); });
     expect(result.context).toBe(existingContext);
   });
 
-  test('skips session with _closing flag and creates new one', () => {
+  test('rejects while a closing session still owns its mapping', async () => {
     const sessions = new Map();
     const oldContext = { pages: () => [] };
     sessions.set('user-1', { context: oldContext, tabGroups: new Map(), lastAccess: 0, _closing: true });
 
-    const newContext = { pages: () => [] };
-    const result = getSession(sessions, 'user-1', () => newContext);
-
-    expect(result.context).toBe(newContext);
-    expect(result.context).not.toBe(oldContext);
-    expect(result._closing).toBeUndefined();
-    // Old entry is replaced in the map
-    expect(sessions.get('user-1').context).toBe(newContext);
+    const createContext = jest.fn(() => ({ pages: () => [] }));
+    let error;
+    try { await getSession(sessions, 'user-1', createContext); } catch (caught) { error = caught; }
+    expect(error).toMatchObject({ statusCode: 503, code: 'session_reset_incomplete' });
+    expect(createContext).not.toHaveBeenCalled();
+    expect(sessions.get('user-1').context).toBe(oldContext);
   });
 
-  test('recreates session when context.pages() throws', () => {
+  test('recreates session when context.pages() throws after verified teardown', async () => {
     const sessions = new Map();
     const deadContext = { pages: () => { throw new Error('context closed'); } };
     sessions.set('user-1', { context: deadContext, tabGroups: new Map(), lastAccess: 0 });
 
     const newContext = { pages: () => [] };
-    const result = getSession(sessions, 'user-1', () => newContext);
+    const result = await getSession(sessions, 'user-1', () => newContext);
 
     expect(result.context).toBe(newContext);
   });
 
-  test('creates fresh session when none exists', () => {
+  test('does not replace a dead session when teardown is unverified', async () => {
+    const sessions = new Map();
+    const oldSession = {
+      context: { pages: () => { throw new Error('context closed'); } },
+      tabGroups: new Map(),
+      lastAccess: 0,
+    };
+    sessions.set('user-1', oldSession);
+    const createContext = jest.fn(() => ({ pages: () => [] }));
+    const destroySession = jest.fn(async () => ({ terminated: false }));
+
+    await expect(getSession(sessions, 'user-1', createContext, destroySession)).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'session_reset_incomplete',
+    });
+    expect(createContext).not.toHaveBeenCalled();
+    expect(sessions.get('user-1')).toBe(oldSession);
+  });
+
+  test('creates fresh session when none exists', async () => {
     const sessions = new Map();
     const newContext = { pages: () => [] };
-    const result = getSession(sessions, 'user-1', () => newContext);
+    const result = await getSession(sessions, 'user-1', () => newContext);
 
     expect(result.context).toBe(newContext);
     expect(sessions.has('user-1')).toBe(true);

@@ -43,8 +43,15 @@ import { createReporter, createTabHealthTracker, collectResourceSnapshot, classi
 import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
-import { killProcessIds } from './lib/browser-processes.js';
-import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses } from './lib/process-ownership.js';
+import {
+  candidateProcessTerminationProven,
+  isCamoufoxProcess,
+  mergeProcessSnapshots,
+  refreshOwnedProcessSnapshot,
+  snapshotOwnedBrowserProcesses,
+  subtractProcessSnapshots,
+} from './lib/process-ownership.js';
+import { signalCapturedProcess } from './lib/pidfd-signal.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
   isDeadContextError, isPageCrashedError, isTimeoutError,
@@ -63,6 +70,7 @@ import {
   closePageWithin,
   deleteSessionMappingIfCurrent,
   hasPendingTabCreations,
+  popupOwnerIsCurrent,
   reservePendingTabCreation,
   scheduleSiblingSessionCleanup,
   sendTabAdmissionError,
@@ -518,8 +526,9 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
 });
 
 let browser = null;
-let _lastBrowserPid = null; // Track PID independently for force-kill after close
+let _lastBrowserPid = null; // Track PID independently for diagnostics after close
 let _browserClosePromise = null; // Shared promise for concurrent close serialization
+let unresolvedBrowserOwnership = null; // Retained exact registry until physical termination proof
 let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale tab detection)
 // userId -> { context, tabGroups: Map<sessionKey, Map<tabId, TabState>>, lastAccess }
 // TabState = { page, refs: Map<refId, {role, name, nth}>, visitedUrls: Set, downloads: Array, toolCalls: number }
@@ -702,14 +711,30 @@ const orphanPageCleanup = new OrphanPageCleanup({
       attempts,
       url: safePageUrl(page),
     });
+    let terminationProof = null;
     try {
       if (owner) {
-        await destroySession(userId, {
+        terminationProof = await destroySession(userId, {
           reason: 'orphan_cleanup_escalation',
           expectedSession: session,
         });
+      } else if (session?._orphanContextOwner) {
+        const contextClosed = await closeContextWithin(session.context, {
+          timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
+        });
+        terminationProof = {
+          terminated: contextClosed,
+          ownerEpoch,
+        };
+        if (!contextClosed && session.browserOwner && browser !== session.browserOwner) {
+          terminationProof = await closeLaunchCandidateWithin(
+            session.browserOwner,
+            null,
+            `stale_orphan_page:${reason}`,
+          );
+        }
       } else if (session) {
-        await closeSession('orphan-superseded', session, {
+        terminationProof = await closeSession('orphan-superseded', session, {
           reason: 'orphan_cleanup_escalation_superseded',
           clearDownloads: true,
           clearLocks: true,
@@ -723,7 +748,10 @@ const orphanPageCleanup = new OrphanPageCleanup({
       });
     }
     if (page?.isClosed?.()) return { terminated: true, ownerEpoch };
-    if (browser?._camofoxGeneration === ownerEpoch) {
+    if (terminationProof?.terminated === true && terminationProof?.ownerEpoch === ownerEpoch) {
+      return terminationProof;
+    }
+    if (ownerEpoch != null && browser?._camofoxGeneration === ownerEpoch) {
       return await closeBrowserFully(`orphan_page:${reason}`);
     }
     return { terminated: false, ownerEpoch };
@@ -748,12 +776,28 @@ async function closeOwnedPage(page, reason = 'managed_page_cleanup', preferredSe
     const cleaned = await orphanPageCleanup.cleanup(owner, page, reason);
     return Boolean(cleaned || orphanPageCleanup.owns(page));
   }
-  log('error', 'unowned resident page survived bounded cleanup; escalating browser teardown', {
+  let pageContext = null;
+  let pageBrowser = null;
+  try {
+    pageContext = page?.context?.() || null;
+    pageBrowser = pageContext?.browser?.() || null;
+  } catch { /* dead page/context */ }
+  const detachedOwner = {
+    context: pageContext,
+    browserOwner: pageBrowser,
+    browserGeneration: pageBrowser?._camofoxGeneration ?? null,
+    _orphanContextOwner: true,
+  };
+  log('error', 'unmapped resident page survived bounded cleanup; retaining detached ownership', {
     reason,
+    ownerEpoch: detachedOwner.browserGeneration,
+    currentBrowserEpoch: browser?._camofoxGeneration ?? null,
     url: safePageUrl(page),
   });
-  const proof = await closeBrowserFully(`unowned_page:${reason}`);
-  return Boolean(proof?.terminated || page?.isClosed?.());
+  const cleaned = await orphanPageCleanup.cleanup(detachedOwner, page, reason, {
+    ownerEpoch: detachedOwner.browserGeneration,
+  });
+  return Boolean(cleaned || orphanPageCleanup.owns(page));
 }
 
 const sessionCreationCoordinator = new SessionCreationCoordinator({
@@ -861,25 +905,41 @@ const tabCapacity = new TabCapacityReservations({
   onRejected: () => tabAdmissionRejectedTotal.inc(),
 });
 
+async function handleRawPageCreationDeadline(entry) {
+  const session = entry.owner;
+  log('error', 'raw page creation exceeded absolute deadline; closing owner session', {
+    userId: entry.userKey,
+    kind: entry.kind,
+  });
+  if (!session || entry.retired) return;
+  const proof = await destroySession(entry.userKey, {
+    reason: 'raw_page_creation_deadline',
+    expectedSession: session,
+  });
+  const proofMatchesOwner = session.browserGeneration != null
+    && proof?.ownerEpoch === session.browserGeneration;
+  if (proof?.terminated === true && proofMatchesOwner) {
+    entry.retire?.();
+    return;
+  }
+  log('error', 'raw page creation ownership retained after unverified teardown', {
+    userId: entry.userKey,
+    kind: entry.kind,
+    ownerEpoch: session.browserGeneration ?? null,
+    proofOwnerEpoch: proof?.ownerEpoch ?? null,
+  });
+  entry.timer = setTimeout(() => {
+    void handleRawPageCreationDeadline(entry).catch(() => {});
+  }, PAGE_CLOSE_TIMEOUT_MS);
+  entry.timer.unref?.();
+}
+
 const rawPageCreations = new RawCreationRegistry({
   maxOutstanding: Math.max(1, TAB_ADMISSION_MAX_ACTIVE * 2),
   maxPerUser: Math.max(1, TAB_ADMISSION_MAX_ACTIVE_PER_USER * 2),
   retryAfterSeconds: 2,
   onRejected: () => tabAdmissionRejectedTotal.inc(),
-  onDeadline: async (entry) => {
-    const session = entry.owner;
-    log('error', 'raw page creation exceeded absolute deadline; closing owner session', {
-      userId: entry.userKey,
-      kind: entry.kind,
-    });
-    if (session) {
-      await destroySession(entry.userKey, {
-        reason: 'raw_page_creation_deadline',
-        expectedSession: session,
-      });
-      entry.retire?.();
-    }
-  },
+  onDeadline: handleRawPageCreationDeadline,
 });
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
@@ -1112,6 +1172,32 @@ function getExternalCamoufoxLaunch() {
   return externalCamoufoxLaunch;
 }
 
+async function handleRawBrowserOwnerDeadline(entry, targetBrowser, reason) {
+  if (entry.retired) return;
+  const ownerEpoch = targetBrowser?._camofoxGeneration ?? null;
+  const proof = browser === targetBrowser
+    ? await closeBrowserFully(reason)
+    : await closeLaunchCandidateWithin(targetBrowser, null, reason);
+  if (proof?.terminated === true && ownerEpoch != null && proof?.ownerEpoch === ownerEpoch) {
+    entry.retire?.();
+    return;
+  }
+  entry.timer = setTimeout(() => {
+    void handleRawBrowserOwnerDeadline(entry, targetBrowser, reason).catch(() => {});
+  }, PAGE_CLOSE_TIMEOUT_MS);
+  entry.timer.unref?.();
+}
+
+async function handleRawContextOwnerDeadline(entry, context, targetBrowser, reason) {
+  if (entry.retired) return;
+  const closed = await closeContextWithin(context, { timeoutMs: PAGE_CLOSE_TIMEOUT_MS });
+  if (closed) {
+    entry.retire?.();
+    return;
+  }
+  await handleRawBrowserOwnerDeadline(entry, targetBrowser, reason);
+}
+
 async function withTemporaryBrowserPage({
   ownerKey,
   targetBrowser,
@@ -1131,19 +1217,35 @@ async function withTemporaryBrowserPage({
       kind: 'temporary_context',
       owner: targetBrowser,
       deadlineMs: NEW_PAGE_TIMEOUT_MS + PAGE_CLOSE_TIMEOUT_MS,
-      onDeadline: async entry => {
-        if (browser === targetBrowser) {
-          const proof = await closeBrowserFully(`${label}_context_deadline`);
-          if (proof?.terminated) entry.retire?.();
-        } else {
-          await closeLaunchCandidateWithin(targetBrowser, null, `${label}_context_deadline`);
-          entry.retire?.();
-        }
-      },
+      onDeadline: entry => handleRawBrowserOwnerDeadline(
+        entry,
+        targetBrowser,
+        `${label}_context_deadline`,
+      ),
+    }),
+    acquireLifetime: () => rawPageCreations.acquire({
+      userKey: ownerKey,
+      kind: 'temporary_context_lifetime',
+      owner: targetBrowser,
+      deadlineMs: requestTimeoutMs() + PAGE_CLOSE_TIMEOUT_MS,
+      onDeadline: entry => handleRawBrowserOwnerDeadline(
+        entry,
+        targetBrowser,
+        `${label}_context_lifetime_deadline`,
+      ),
     }),
     cleanup: async context => {
       const closed = await closeContextWithin(context, { timeoutMs: PAGE_CLOSE_TIMEOUT_MS });
-      if (!closed && browser === targetBrowser) await closeBrowserFully(`${label}_context_cleanup`);
+      if (closed) return true;
+      const ownerEpoch = targetBrowser?._camofoxGeneration ?? null;
+      const proof = browser === targetBrowser
+        ? await closeBrowserFully(`${label}_context_cleanup`)
+        : await closeLaunchCandidateWithin(targetBrowser, null, `${label}_context_cleanup`);
+      if (proof?.terminated === true && ownerEpoch != null && proof?.ownerEpoch === ownerEpoch) return true;
+      throw Object.assign(new Error(`${label} context cleanup could not verify termination`), {
+        statusCode: 503,
+        code: 'resource_cleanup_incomplete',
+      });
     },
   }, async context => {
     const capacityLease = tabCapacity.reserve(ownerKey);
@@ -1159,16 +1261,27 @@ async function withTemporaryBrowserPage({
           kind: 'temporary_page',
           owner: context,
           deadlineMs: NEW_PAGE_TIMEOUT_MS + PAGE_CLOSE_TIMEOUT_MS,
-          onDeadline: async entry => {
-            const closed = await closeContextWithin(context, { timeoutMs: PAGE_CLOSE_TIMEOUT_MS });
-            if (closed) entry.retire?.();
-            else if (browser === targetBrowser) {
-              const proof = await closeBrowserFully(`${label}_page_deadline`);
-              if (proof?.terminated) entry.retire?.();
-            }
-          },
+          onDeadline: entry => handleRawContextOwnerDeadline(
+            entry,
+            context,
+            targetBrowser,
+            `${label}_page_deadline`,
+          ),
         }),
-        cleanup: safePageClose,
+        cleanup: async page => {
+          if (await safePageClose(page)) return true;
+          const contextClosed = await closeContextWithin(context, { timeoutMs: PAGE_CLOSE_TIMEOUT_MS });
+          if (contextClosed) return true;
+          const ownerEpoch = targetBrowser?._camofoxGeneration ?? null;
+          const proof = browser === targetBrowser
+            ? await closeBrowserFully(`${label}_page_cleanup`)
+            : await closeLaunchCandidateWithin(targetBrowser, null, `${label}_page_cleanup`);
+          if (proof?.terminated === true && ownerEpoch != null && proof?.ownerEpoch === ownerEpoch) return true;
+          throw Object.assign(new Error(`${label} page cleanup could not verify termination`), {
+            statusCode: 503,
+            code: 'resource_cleanup_incomplete',
+          });
+        },
       }, operation);
     } finally {
       capacityLease();
@@ -1200,10 +1313,83 @@ async function probeGoogleSearch(candidateBrowser, launchSlot) {
   });
 }
 
+function refreshOwnedRegistry(registry) {
+  const current = refreshOwnedProcessSnapshot(registry);
+  return {
+    registry: mergeProcessSnapshots(registry, current),
+    current,
+  };
+}
+
+async function verifyStableOwnedTermination(registry, checks = 2) {
+  let retained = registry;
+  for (let attempt = 0; attempt < checks; attempt++) {
+    const refreshed = refreshOwnedRegistry(retained);
+    retained = refreshed.registry;
+    if (refreshed.current.length > 0) {
+      return { terminated: false, registry: retained, survivors: refreshed.current };
+    }
+    if (attempt + 1 < checks) await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return { terminated: true, registry: retained, survivors: [] };
+}
+
+async function closeLaunchAttemptWithoutBrowserUntilVerified(ownershipBaseline, localVirtualDisplay, reason) {
+  let registry = [];
+  while (true) {
+    try {
+      const delta = subtractProcessSnapshots(
+        snapshotOwnedBrowserProcesses(process.pid),
+        ownershipBaseline,
+      );
+      registry = mergeProcessSnapshots(registry, delta);
+      const refreshed = refreshOwnedRegistry(registry);
+      registry = refreshed.registry;
+      await _forceKillBrowserProcesses(reason, refreshed.current);
+      if (localVirtualDisplay) {
+        try { localVirtualDisplay.kill(); } catch { /* exact process proof below remains authoritative */ }
+      }
+      const proof = await verifyStableOwnedTermination(registry);
+      registry = proof.registry;
+      if (proof.terminated) return proof;
+    } catch {
+      // Procfs or cleanup unavailable: retain the launch slot and retry.
+    }
+    await new Promise(resolve => setTimeout(resolve, PAGE_CLOSE_TIMEOUT_MS));
+  }
+}
+
 async function closeLaunchCandidateWithin(candidateBrowser, localVirtualDisplay, reason) {
-  const pid = candidateBrowser?.process?.()?.pid ?? null;
-  const owned = snapshotOwnedBrowserProcesses(process.pid);
+  const ownerEpoch = candidateBrowser?._camofoxGeneration ?? null;
+  let ownershipCaptured = candidateBrowser?._camofoxOwnershipSnapshotCaptured === true;
+  let registry = candidateBrowser?._camofoxOwnedProcesses ?? [];
+  let current = [];
+  if (!ownershipCaptured && Array.isArray(candidateBrowser?._camofoxOwnershipBaseline)) {
+    try {
+      registry = subtractProcessSnapshots(
+        snapshotOwnedBrowserProcesses(process.pid),
+        candidateBrowser._camofoxOwnershipBaseline,
+      );
+      candidateBrowser._camofoxOwnedProcesses = registry;
+      candidateBrowser._camofoxOwnershipSnapshotCaptured = true;
+      ownershipCaptured = true;
+    } catch {
+      // Without a complete start-time-safe snapshot, ownership stays unresolved.
+    }
+  }
+  const refreshOwnership = () => {
+    if (!ownershipCaptured) return;
+    const refreshed = refreshOwnedRegistry(registry);
+    registry = refreshed.registry;
+    current = refreshed.current;
+    candidateBrowser._camofoxOwnedProcesses = registry;
+  };
+  try { refreshOwnership(); } catch { ownershipCaptured = false; }
   let timer;
+  const ownershipMonitor = setInterval(() => {
+    try { refreshOwnership(); } catch { ownershipCaptured = false; }
+  }, 50);
+  ownershipMonitor.unref?.();
   try {
     if (candidateBrowser) {
       await Promise.race([
@@ -1213,11 +1399,43 @@ async function closeLaunchCandidateWithin(candidateBrowser, localVirtualDisplay,
     }
   } finally {
     clearTimeout(timer);
-    if (pid) await _forceKillProcessTree(pid, reason);
-    await _forceKillBrowserProcesses(reason, owned);
+    try { refreshOwnership(); } catch { ownershipCaptured = false; }
+    await _forceKillBrowserProcesses(reason, current);
     if (localVirtualDisplay) {
-      try { localVirtualDisplay.kill(); } catch { /* best effort after process kill */ }
+      try { localVirtualDisplay.kill(); } catch { /* exact process proof below remains authoritative */ }
     }
+    clearInterval(ownershipMonitor);
+  }
+  let stableProof = { terminated: false, registry, survivors: current };
+  if (ownershipCaptured) {
+    try {
+      stableProof = await verifyStableOwnedTermination(registry);
+      registry = stableProof.registry;
+      candidateBrowser._camofoxOwnedProcesses = registry;
+    } catch {
+      ownershipCaptured = false;
+    }
+  }
+  let connected = false;
+  try { connected = Boolean(candidateBrowser?.isConnected?.()); } catch { /* transport is gone */ }
+  return {
+    terminated: candidateProcessTerminationProven({
+      ownershipCaptured,
+      connected,
+      survivors: stableProof.survivors,
+    }) && stableProof.terminated,
+    ownerEpoch,
+  };
+}
+
+async function closeLaunchCandidateUntilVerified(candidateBrowser, localVirtualDisplay, reason) {
+  const ownerEpoch = candidateBrowser?._camofoxGeneration ?? null;
+  while (true) {
+    const proof = await closeLaunchCandidateWithin(candidateBrowser, localVirtualDisplay, reason);
+    if (proof?.terminated === true && ownerEpoch != null && proof?.ownerEpoch === ownerEpoch) return proof;
+    await new Promise(resolve => {
+      setTimeout(resolve, PAGE_CLOSE_TIMEOUT_MS);
+    });
   }
 }
 
@@ -1231,6 +1449,25 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
       if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
     }
   };
+}
+
+async function closeRetainedBrowserOwnership(reason) {
+  const retained = unresolvedBrowserOwnership;
+  if (!retained) return null;
+  const refreshed = refreshOwnedRegistry(retained.registry);
+  retained.registry = refreshed.registry;
+  await _forceKillBrowserProcesses(reason, refreshed.current);
+  const processProof = await verifyStableOwnedTermination(retained.registry);
+  retained.registry = processProof.registry;
+  let connected = false;
+  try { connected = Boolean(retained.browser?.isConnected?.()); } catch { /* transport is gone */ }
+  const proof = {
+    terminated: processProof.terminated && !connected,
+    reason,
+    ownerEpoch: retained.ownerEpoch,
+  };
+  if (proof.terminated && unresolvedBrowserOwnership === retained) unresolvedBrowserOwnership = null;
+  return proof;
 }
 
 /**
@@ -1255,23 +1492,54 @@ async function closeBrowserFully(reason) {
 async function _closeBrowserFullyImpl(reason) {
   const b = browser;
   if (!b) {
+    if (unresolvedBrowserOwnership) {
+      return await closeRetainedBrowserOwnership(reason);
+    }
     const launchSlot = browserLaunchSlot;
-    if (launchSlot) invalidateBrowserLaunch(launchSlot, new Error(`Browser launch terminated: ${reason}`));
-    const launchProcesses = snapshotOwnedBrowserProcesses(process.pid);
-    await _forceKillBrowserProcesses(reason, launchProcesses);
-    const survivors = survivingOwnedBrowserProcesses(launchProcesses);
-    const proof = { terminated: survivors.length === 0, reason, ownerEpoch: launchSlot?.id || null };
-    if (proof.terminated) retireBrowserLaunchSlot(launchSlot);
-    return proof;
+    if (launchSlot) {
+      invalidateBrowserLaunch(launchSlot, new Error(`Browser launch terminated: ${reason}`));
+      // A timed-out raw launch can still create processes later. Keep its slot
+      // exclusive and block replacements until the raw operation has settled
+      // and its candidate cleanup has produced a termination proof.
+      if (!launchSlot.settlement) {
+        return { terminated: false, reason, ownerEpoch: launchSlot.id };
+      }
+      await launchSlot.settlement;
+    }
+    let registry = snapshotOwnedBrowserProcesses(process.pid);
+    const refreshed = refreshOwnedRegistry(registry);
+    registry = refreshed.registry;
+    await _forceKillBrowserProcesses(reason, refreshed.current);
+    const processProof = await verifyStableOwnedTermination(registry);
+    return {
+      terminated: processProof.terminated && (!launchSlot || browserLaunchSlot !== launchSlot),
+      reason,
+      ownerEpoch: launchSlot?.id || null,
+    };
   }
   clearBrowserIdleTimer();
 
-  // Capture PID/process snapshot before nulling browser ref.
+  // Retain the exact launch-time registry while continuously discovering later
+  // members through verified ancestry/process-group continuity.
   const pid = _lastBrowserPid;
-  // Capture ownership before Playwright closes and reparents its children.
-  // Multiple scoped servers may share a host, so a later /proc name scan must
-  // never treat another server's browser as one of our survivors.
-  const ownedBrowserProcesses = snapshotOwnedBrowserProcesses(process.pid);
+  let ownershipCaptured = b._camofoxOwnershipSnapshotCaptured === true;
+  let registry = b._camofoxOwnedProcesses ?? [];
+  let current = [];
+  const retainedOwnership = {
+    browser: b,
+    ownerEpoch: b._camofoxGeneration || null,
+    registry,
+  };
+  unresolvedBrowserOwnership = retainedOwnership;
+  const refreshOwnership = () => {
+    if (!ownershipCaptured) return;
+    const refreshed = refreshOwnedRegistry(registry);
+    registry = refreshed.registry;
+    current = refreshed.current;
+    b._camofoxOwnedProcesses = registry;
+    retainedOwnership.registry = registry;
+  };
+  try { refreshOwnership(); } catch { ownershipCaptured = false; }
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
 
@@ -1282,8 +1550,11 @@ async function _closeBrowserFullyImpl(reason) {
   browser = null;
   _lastBrowserPid = null;
 
-  // Close through Playwright (sends CDP Browser.close, then SIGKILL process group)
   let closeTimer;
+  const ownershipMonitor = setInterval(() => {
+    try { refreshOwnership(); } catch { ownershipCaptured = false; }
+  }, 50);
+  ownershipMonitor.unref?.();
   try {
     await Promise.race([
       b.close(),
@@ -1293,21 +1564,32 @@ async function _closeBrowserFullyImpl(reason) {
     log('warn', 'browser.close() failed or timed out', { reason, error: err.message, pid });
   } finally {
     clearTimeout(closeTimer);
-  }
-
-  // Force-kill only survivors captured before this close began.
-  if (pid) {
-    await _forceKillProcessTree(pid, reason);
-  }
-  await _forceKillBrowserProcesses(reason, ownedBrowserProcesses);
-  if (virtualDisplay) {
-    try { virtualDisplay.kill(); } catch (error) {
-      log('warn', 'virtual display cleanup failed', { reason, error: error.message });
+    try { refreshOwnership(); } catch { ownershipCaptured = false; }
+    await _forceKillBrowserProcesses(reason, current);
+    if (virtualDisplay) {
+      try { virtualDisplay.kill(); } catch (error) {
+        log('warn', 'virtual display cleanup failed; exact process proof retained', { reason, error: error.message });
+      }
+      virtualDisplay = null;
     }
-    virtualDisplay = null;
+    clearInterval(ownershipMonitor);
   }
   browserLaunchProxy = null;
-  const survivors = survivingOwnedBrowserProcesses(ownedBrowserProcesses);
+  let processProof = { terminated: false, registry, survivors: current };
+  if (ownershipCaptured) {
+    try {
+      processProof = await verifyStableOwnedTermination(registry);
+      registry = processProof.registry;
+      b._camofoxOwnedProcesses = registry;
+      retainedOwnership.registry = registry;
+    } catch (error) {
+      ownershipCaptured = false;
+      log('warn', 'published browser termination scan incomplete', { reason, error: error.message });
+    }
+  }
+  let connected = false;
+  try { connected = Boolean(b.isConnected?.()); } catch { /* transport is gone */ }
+  const survivors = processProof.survivors;
 
   // Clean up stale Firefox temp profiles (enable_cache: true accumulates data)
   try {
@@ -1347,60 +1629,30 @@ async function _closeBrowserFullyImpl(reason) {
     reason, pid, preCloseFds, postCloseFds, preCloseHandles, postCloseHandles,
     survivors: survivors.map(processInfo => processInfo.pid),
   });
+  const terminated = ownershipCaptured && !connected && processProof.terminated;
+  if (terminated && unresolvedBrowserOwnership === retainedOwnership) unresolvedBrowserOwnership = null;
   return {
-    terminated: survivors.length === 0,
+    terminated,
     reason,
     ownerEpoch: b._camofoxGeneration || null,
   };
 }
 
-/**
- * Force-kill a browser process tree by PID. On Linux, kills the process group
- * (SIGKILL -pid). Orphan cleanup is deliberately left to the ownership
- * snapshot captured before browser.close(), below.
- */
-async function _forceKillProcessTree(pid, reason) {
-  if (!pid || pid <= 1) return;
-
-  // Kill the specific browser process first (positive PID = single process)
-  try {
-    process.kill(pid, 'SIGKILL');
-    log('info', 'sent SIGKILL to browser process', { pid, reason });
-  } catch (err) {
-    if (err.code !== 'ESRCH') {
-      log('warn', 'failed to kill browser process', { pid, error: err.message });
-    }
-  }
-
-  // Then try the process group (Playwright launches with detached:true on Linux,
-  // making the browser a process group leader)
-  try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    // ESRCH = group doesn't exist (browser wasn't a group leader), which is fine
-  }
-
-  // Give the group kill time to complete. Any descendants that escaped it are
-  // selected later only from the pre-close, starttime-safe ownership snapshot.
-  await new Promise(r => setTimeout(r, 200));
-
-  // Give the OS a moment to reclaim resources
-  await new Promise(r => setTimeout(r, 300));
-}
-
 async function _forceKillBrowserProcesses(reason, ownedBrowserProcesses = []) {
   if (process.platform !== 'linux') return;
-  let victims = [];
+  const victims = [];
   try {
-    victims = survivingOwnedBrowserProcesses(ownedBrowserProcesses).map(proc => proc.pid);
+    for (const captured of ownedBrowserProcesses) {
+      if (signalCapturedProcess(captured, 'SIGKILL')) victims.push(captured.pid);
+    }
   } catch (err) {
-    log('warn', 'failed to scan for browser survivor processes', { reason, error: err.message });
-    return;
+    log('warn', 'failed to verify or kill browser survivor processes', { reason, error: err.message });
+    throw err;
   }
 
   if (victims.length > 0) {
-    log('warn', 'killing browser survivor processes', { reason, victims });
-    await killProcessIds(victims, { signal: 'SIGKILL', delayMs: 300 });
+    log('warn', 'killed exact browser survivor processes', { reason, victims });
+    await new Promise(resolve => setTimeout(resolve, 300));
   }
 }
 
@@ -1422,6 +1674,9 @@ async function launchBrowserInstance(launchSlot) {
   const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Capture before creating Xvfb so every process belonging to this attempt,
+    // including its virtual display, participates in exact termination proof.
+    const ownershipBaseline = snapshotOwnedBrowserProcesses(process.pid);
     const launchProxy = proxyPool
       ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
       : null;
@@ -1488,6 +1743,18 @@ async function launchBrowserInstance(launchSlot) {
 
       candidateBrowser = await firefox.launch(options);
       candidateBrowser._camofoxGeneration = launchSlot.id;
+      candidateBrowser._camofoxOwnershipBaseline = ownershipBaseline;
+      candidateBrowser._camofoxOwnershipSnapshotCaptured = false;
+      candidateBrowser._camofoxOwnedProcesses = subtractProcessSnapshots(
+        snapshotOwnedBrowserProcesses(process.pid),
+        ownershipBaseline,
+      );
+      candidateBrowser._camofoxOwnershipSnapshotCaptured = true;
+      if (!candidateBrowser._camofoxOwnedProcesses.some(isCamoufoxProcess)) {
+        throw Object.assign(new Error('Camoufox process ownership unavailable after launch'), {
+          code: 'browser_process_ownership_unavailable',
+        });
+      }
       assertBrowserLaunchPublishable(launchSlot);
 
       if (proxyPool?.canRotateSessions) {
@@ -1500,7 +1767,7 @@ async function launchBrowserInstance(launchSlot) {
             url: probe.url,
           });
           if (attempt < maxAttempts) {
-            await closeLaunchCandidateWithin(candidateBrowser, localVirtualDisplay, 'launch_probe_retry');
+            await closeLaunchCandidateUntilVerified(candidateBrowser, localVirtualDisplay, 'launch_probe_retry');
             candidateBrowser = null;
             localVirtualDisplay = null;
             continue;
@@ -1517,7 +1784,9 @@ async function launchBrowserInstance(launchSlot) {
       assertBrowserLaunchPublishable(launchSlot);
       virtualDisplay = localVirtualDisplay;
       browserLaunchProxy = launchProxy;
-      _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
+      _lastBrowserPid = candidateBrowser._camofoxOwnedProcesses.find(proc => /camoufox-bin/.test(proc.cmdline))?.pid
+        ?? candidateBrowser._camofoxOwnedProcesses[0]?.pid
+        ?? null;
       browser = candidateBrowser; // publish AFTER PID is captured
       _lastBrowserStopReason = null; // clear — browser is healthy
       _lastBrowserRestartAt = Date.now();
@@ -1542,7 +1811,15 @@ async function launchBrowserInstance(launchSlot) {
         error: err.message,
         proxySession: launchProxy?.sessionId || null,
       });
-      await closeLaunchCandidateWithin(candidateBrowser, localVirtualDisplay, 'launch_attempt_failed');
+      if (candidateBrowser) {
+        await closeLaunchCandidateUntilVerified(candidateBrowser, localVirtualDisplay, 'launch_attempt_failed');
+      } else {
+        await closeLaunchAttemptWithoutBrowserUntilVerified(
+          ownershipBaseline,
+          localVirtualDisplay,
+          'launch_attempt_failed_without_browser',
+        );
+      }
       candidateBrowser = null;
       localVirtualDisplay = null;
       if (!launchSlot.publishable) break;
@@ -1578,6 +1855,16 @@ async function ensureBrowser() {
   clearBrowserIdleTimer();
   if (_browserClosePromise) {
     await _browserClosePromise;
+  }
+  if (unresolvedBrowserOwnership) {
+    const proof = await closeBrowserFully('unresolved_browser_ownership');
+    if (proof?.terminated !== true) {
+      throw Object.assign(new Error('Prior browser teardown is not yet verified'), {
+        statusCode: 503,
+        code: 'browser_teardown_incomplete',
+        retryable: true,
+      });
+    }
   }
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
@@ -1627,14 +1914,38 @@ function clearSessionLocks(session) {
   refreshTabLockQueueDepth();
 }
 
+const sessionCloseRetryTimers = new WeakMap();
+
+function scheduleSessionCloseRetry(userId, session, options) {
+  if (sessionCloseRetryTimers.has(session)) return;
+  const timer = setTimeout(() => {
+    sessionCloseRetryTimers.delete(session);
+    void closeSession(userId, session, options).catch(() => {});
+  }, PAGE_CLOSE_TIMEOUT_MS);
+  timer.unref?.();
+  sessionCloseRetryTimers.set(session, timer);
+}
+
 async function closeSession(userId, session, options = {}) {
   if (!session) return;
   if (session._closePromise) return session._closePromise;
   closingSessions.add(session);
   const closing = closeSessionImpl(userId, session, options);
   session._closePromise = closing.then((result) => {
-    closingSessions.delete(session);
+    if (result?.terminated === true) {
+      const retryTimer = sessionCloseRetryTimers.get(session);
+      if (retryTimer) clearTimeout(retryTimer);
+      sessionCloseRetryTimers.delete(session);
+      closingSessions.delete(session);
+    } else {
+      session._closePromise = null;
+      scheduleSessionCloseRetry(userId, session, options);
+    }
     return result;
+  }, (error) => {
+    session._closePromise = null;
+    scheduleSessionCloseRetry(userId, session, options);
+    throw error;
   });
   return session._closePromise;
 }
@@ -1702,25 +2013,56 @@ async function closeSessionImpl(userId, session, {
       });
     },
   });
+  let terminationProof = contextClosed
+    ? { terminated: true, ownerEpoch: session.browserGeneration ?? null }
+    : null;
   if (!contextClosed) {
-    await closeBrowserFully('session_context_close_timeout');
-    // Browser termination proves resource ownership ended for every context.
-    // Trigger sibling cleanup without awaiting it here: awaiting another
-    // closeSession from inside this close path can form an A -> B -> A cycle.
-    scheduleSiblingSessionCleanup({
-      sessions,
-      currentSession: session,
-      cleanup: (otherUserId, otherSession) => destroySession(otherUserId, {
-        reason: 'browser_escalation',
-        expectedSession: otherSession,
-      }),
-      onError: (error, otherUserId) => {
-        log('warn', 'browser escalation sibling cleanup failed', {
-          userId: otherUserId,
-          error: error.message,
-        });
-      },
-    });
+    const ownerIsCurrent = browser?._camofoxGeneration === session.browserGeneration
+      && (!session.browserOwner || browser === session.browserOwner);
+    if (ownerIsCurrent) {
+      terminationProof = await closeBrowserFully('session_context_close_timeout');
+    } else if (session.browserOwner) {
+      terminationProof = await closeLaunchCandidateWithin(
+        session.browserOwner,
+        null,
+        'stale_session_context_close_timeout',
+      );
+    } else {
+      terminationProof = { terminated: false, ownerEpoch: session.browserGeneration ?? null };
+    }
+    const proofMatchesOwner = session.browserGeneration != null
+      && terminationProof?.ownerEpoch === session.browserGeneration;
+    if (terminationProof?.terminated !== true || !proofMatchesOwner) {
+      log('error', 'session teardown retained ownership after unverified browser termination', {
+        userId: key,
+        reason,
+        ownerEpoch: session.browserGeneration ?? null,
+        proofOwnerEpoch: terminationProof?.ownerEpoch ?? null,
+      });
+      return {
+        terminated: false,
+        ownerEpoch: session.browserGeneration ?? null,
+        proofOwnerEpoch: terminationProof?.ownerEpoch ?? null,
+      };
+    }
+    if (ownerIsCurrent) {
+      // Verified current-browser termination ended ownership for every context
+      // of this generation. Avoid awaiting sibling close paths here.
+      scheduleSiblingSessionCleanup({
+        sessions,
+        currentSession: session,
+        cleanup: (otherUserId, otherSession) => destroySession(otherUserId, {
+          reason: 'browser_escalation',
+          expectedSession: otherSession,
+        }),
+        onError: (error, otherUserId) => {
+          log('warn', 'browser escalation sibling cleanup failed', {
+            userId: otherUserId,
+            error: error.message,
+          });
+        },
+      });
+    }
   }
   const mappingDeleted = deleteSessionMappingIfCurrent(sessions, key, session);
   if (mappingDeleted) sessionCreationCoordinator.release(key);
@@ -1739,6 +2081,7 @@ async function closeSessionImpl(userId, session, {
   });
 
   refreshActiveTabsGauge();
+  return terminationProof;
 }
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
@@ -1761,7 +2104,22 @@ async function getSession(userId, { trace = false, signal } = {}) {
   // Check if existing session's context is still alive
   if (session) {
     if (session._closing) {
-      // Session is being torn down by reaper/expiry -- treat as dead
+      if (session._closePromise) {
+        await withTimeout(
+          session._closePromise,
+          PAGE_CLOSE_TIMEOUT_MS,
+          'closing session ownership',
+        ).catch(() => {});
+      }
+      if (sessions.get(key) === session) {
+        throw Object.assign(new Error('Prior session teardown is not yet verified'), {
+          statusCode: 503,
+          code: 'session_reset_incomplete',
+          retryable: true,
+        });
+      }
+      const replacement = sessions.get(key) || null;
+      if (replacement) return await getSession(userId, { trace, signal });
       session = null;
     } else {
       try {
@@ -1769,7 +2127,16 @@ async function getSession(userId, { trace = false, signal } = {}) {
         session.context.pages();
       } catch (err) {
         log('warn', 'session context dead, recreating', { userId: key, error: err.message });
-        await destroySession(key, { reason: 'dead_context', expectedSession: session });
+        const terminationProof = await destroySession(key, { reason: 'dead_context', expectedSession: session });
+        if (sessions.get(key) === session || terminationProof?.terminated !== true) {
+          throw Object.assign(new Error('Dead session teardown is not yet verified'), {
+            statusCode: 503,
+            code: 'session_reset_incomplete',
+            retryable: true,
+          });
+        }
+        const replacement = sessions.get(key) || null;
+        if (replacement) return await getSession(userId, { trace, signal });
         session = null;
       }
     }
@@ -1840,15 +2207,11 @@ async function getSession(userId, { trace = false, signal } = {}) {
           kind: 'context',
           owner: b,
           deadlineMs: NEW_PAGE_TIMEOUT_MS + PAGE_CLOSE_TIMEOUT_MS,
-          onDeadline: async (entry) => {
-            let proof;
-            if (browser === b) proof = await closeBrowserFully('raw_context_creation_deadline');
-            else {
-              await closeLaunchCandidateWithin(b, null, 'raw_context_creation_deadline');
-              proof = { terminated: true, ownerEpoch: b._camofoxGeneration || null };
-            }
-            if (proof?.terminated) entry.retire?.();
-          },
+          onDeadline: entry => handleRawBrowserOwnerDeadline(
+            entry,
+            b,
+            'raw_context_creation_deadline',
+          ),
         }),
         validate: () => {
           assertCurrent();
@@ -1858,7 +2221,11 @@ async function getSession(userId, { trace = false, signal } = {}) {
         },
         cleanup: async lateContext => {
           const closed = await closeContextWithin(lateContext, { timeoutMs: PAGE_CLOSE_TIMEOUT_MS });
-          if (!closed && browser === b) await closeBrowserFully('late_context_cleanup_timeout');
+          if (closed) return true;
+          const proof = browser === b
+            ? await closeBrowserFully('late_context_cleanup_timeout')
+            : await closeLaunchCandidateWithin(b, null, 'late_context_cleanup_timeout');
+          return Boolean(proof?.terminated === true && proof?.ownerEpoch === b._camofoxGeneration);
         },
       });
       let created = null;
@@ -1881,6 +2248,7 @@ async function getSession(userId, { trace = false, signal } = {}) {
 
         created = {
           context,
+          browserOwner: b,
           browserGeneration: b._camofoxGeneration || null,
           generation,
           tabGroups: new Map(),
@@ -1891,7 +2259,6 @@ async function getSession(userId, { trace = false, signal } = {}) {
           _pendingTabCreations: 0,
         };
         assertCurrent();
-        sessions.set(key, created);
         await pluginEvents.emitAsync('session:created', {
           userId: key,
           generation,
@@ -1899,7 +2266,23 @@ async function getSession(userId, { trace = false, signal } = {}) {
           session: created,
         });
         assertCurrent();
-        if (sessions.get(key) !== created || created._closing) {
+        if (created._closing) {
+          throw Object.assign(new Error('Session creation was superseded before publication completed'), {
+            code: 'session_superseded',
+            statusCode: 409,
+          });
+        }
+        const incumbentSession = sessions.get(key);
+        if (incumbentSession && incumbentSession !== created) {
+          throw Object.assign(new Error('Prior session ownership is not yet retired'), {
+            code: 'session_reset_incomplete',
+            statusCode: 503,
+            retryable: true,
+          });
+        }
+        sessions.set(key, created);
+        assertCurrent();
+        if (sessions.get(key) !== created) {
           throw Object.assign(new Error('Session creation was superseded before publication completed'), {
             code: 'session_superseded',
             statusCode: 409,
@@ -1915,6 +2298,7 @@ async function getSession(userId, { trace = false, signal } = {}) {
       } catch (error) {
         const losing = created || {
           context,
+          browserOwner: b,
           browserGeneration: b._camofoxGeneration || null,
           generation,
           tabGroups: new Map(),
@@ -2368,7 +2752,16 @@ async function resetSession(userId, {
       const current = sessions.get(key);
       if (current) {
         hadLive = true;
-        await closeSession(key, current, { reason, clearDownloads: true, clearLocks: true });
+        const proof = await closeSession(key, current, { reason, clearDownloads: true, clearLocks: true });
+        const proofMatchesOwner = current.browserGeneration != null
+          && proof?.ownerEpoch === current.browserGeneration;
+        if (proof?.terminated !== true || !proofMatchesOwner) {
+          throw Object.assign(new Error('Session reset could not verify resource termination'), {
+            statusCode: 503,
+            code: 'session_reset_incomplete',
+            retryable: true,
+          });
+        }
       }
       await whileBlocked({ key, hadLive, hadCreation });
     },
@@ -2386,12 +2779,11 @@ async function destroySession(userId, {
 
   // A stale failure must never invalidate or close a replacement generation.
   if (expectedSession && current !== expectedSession && (current || hadCreation)) {
-    await closeSession(key, expectedSession, {
+    return await closeSession(key, expectedSession, {
       reason: `${reason}_superseded`,
       clearDownloads: true,
       clearLocks: true,
     });
-    return false;
   }
 
   const invalidationError = Object.assign(new Error(`Session invalidated: ${reason}`), {
@@ -2401,12 +2793,14 @@ async function destroySession(userId, {
   });
   const invalidation = sessionCreationCoordinator.invalidate(key, invalidationError);
   const session = expectedSession || current;
+  let terminationProof = null;
   if (session) {
     log('warn', 'destroying session', { userId: key, reason });
-    await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
+    terminationProof = await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
   }
   await invalidation;
-  return Boolean(session || hadCreation);
+  if (session) return terminationProof;
+  return { terminated: !hadCreation, ownerEpoch: null };
 }
 
 function findTab(session, tabId) {
@@ -2472,13 +2866,24 @@ function createTabState(page) {
  * The handler registers the popup in the same session's '__popups__' tab group
  * and recursively attaches itself to the new page.
  */
-function attachPopupHandler(page, userId, sessionKey) {
+function attachPopupHandler(page, userId, sessionKey, ownerSession) {
+  const ownerContext = ownerSession?.context;
+  const ownerGeneration = ownerSession?.browserGeneration ?? null;
   page.on('popup', (popupPage) => {
     void (async () => {
       const key = normalizeUserId(userId);
       const currentSession = sessions.get(key);
-      if (!currentSession || currentSession._closing) {
-        await closeOwnedPage(popupPage, 'popup_owner_unavailable', currentSession);
+      let popupContext = null;
+      try { popupContext = popupPage?.context?.(); } catch { /* dead popup */ }
+      const ownerStillCurrent = popupOwnerIsCurrent({
+        currentSession,
+        ownerSession,
+        popupContext,
+        ownerContext,
+        ownerGeneration,
+      });
+      if (!ownerStillCurrent) {
+        await closeOwnedPage(popupPage, 'popup_owner_unavailable', ownerSession);
         return;
       }
 
@@ -2497,8 +2902,14 @@ function attachPopupHandler(page, userId, sessionKey) {
         return;
       }
 
-      if (sessions.get(key) !== currentSession || currentSession._closing) {
-        await closeOwnedPage(popupPage, 'popup_owner_unavailable', currentSession);
+      if (!popupOwnerIsCurrent({
+        currentSession: sessions.get(key),
+        ownerSession,
+        popupContext,
+        ownerContext,
+        ownerGeneration,
+      })) {
+        await closeOwnedPage(popupPage, 'popup_owner_unavailable', ownerSession);
         return;
       }
       const popupTabId = fly.makeTabId();
@@ -2511,10 +2922,10 @@ function attachPopupHandler(page, userId, sessionKey) {
       log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
       pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
       // Recursively handle popups from the popup
-      attachPopupHandler(popupPage, userId, sessionKey);
+      attachPopupHandler(popupPage, userId, sessionKey, ownerSession);
     })().catch((error) => {
       log('warn', 'popup adoption failed', { userId: normalizeUserId(userId), error: error.message });
-      closeOwnedPage(popupPage, 'popup_adoption_failed').catch(() => {});
+      closeOwnedPage(popupPage, 'popup_adoption_failed', ownerSession).catch(() => {});
     });
   });
 }
@@ -2698,7 +3109,7 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
   group.set(tabId, tabState);
-  attachPopupHandler(page, userId, sessionKey);
+  attachPopupHandler(page, userId, sessionKey, session);
   refreshActiveTabsGauge();
 
   log('warn', 'replaying google search on fresh context (per-context proxy rotation)', {
@@ -3683,7 +4094,7 @@ app.post('/tabs', async (req, res) => {
               group.set(tabId, tabState);
               releasePageLease(effectiveSession, resource.lease);
               resource.lease = null;
-              attachPopupHandler(resource.page, userId, resolvedSessionKey);
+              attachPopupHandler(resource.page, userId, resolvedSessionKey, effectiveSession);
               refreshActiveTabsGauge();
             },
             unregister: async () => {
@@ -3915,7 +4326,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
-          attachPopupHandler(page, userId, currentSessionKey);
+          attachPopupHandler(page, userId, currentSessionKey, session);
           refreshActiveTabsGauge();
         };
 
@@ -6761,7 +7172,7 @@ app.post('/tabs/open', async (req, res) => {
               group.set(tabId, tabState);
               releasePageLease(effectiveSession, resource.lease);
               resource.lease = null;
-              attachPopupHandler(resource.page, userId, listItemId);
+              attachPopupHandler(resource.page, userId, listItemId, effectiveSession);
               refreshActiveTabsGauge();
             },
             unregister: async () => {

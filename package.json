@@ -45,6 +45,8 @@
     "tsconfig.json",
     "openclaw.plugin.json",
     "mcp/",
+    "openapi.json",
+    "docs/",
     "bin/",
     "scripts/",
     "run.sh",

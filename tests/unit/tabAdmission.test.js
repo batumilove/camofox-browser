@@ -11,6 +11,7 @@ import {
   closePageWithin,
   deleteSessionMappingIfCurrent,
   hasPendingTabCreations,
+  popupOwnerIsCurrent,
   reservePendingTabCreation,
   scheduleSiblingSessionCleanup,
   sendTabAdmissionError,
@@ -604,6 +605,47 @@ describe('bounded context cleanup', () => {
   });
 });
 
+describe('popup generation ownership', () => {
+  const ownerContext = {};
+  const ownerSession = { context: ownerContext, browserGeneration: 'browser-1' };
+
+  test('accepts only the captured current session, context, and generation', () => {
+    expect(popupOwnerIsCurrent({
+      currentSession: ownerSession,
+      ownerSession,
+      popupContext: ownerContext,
+      ownerContext,
+      ownerGeneration: 'browser-1',
+    })).toBe(true);
+  });
+
+  test.each([
+    ['replacement session', { currentSession: { context: ownerContext, browserGeneration: 'browser-2' } }],
+    ['stale popup context', { popupContext: {} }],
+    ['changed generation', { ownerGeneration: 'browser-2' }],
+  ])('rejects %s', (_label, override) => {
+    expect(popupOwnerIsCurrent({
+      currentSession: ownerSession,
+      ownerSession,
+      popupContext: ownerContext,
+      ownerContext,
+      ownerGeneration: 'browser-1',
+      ...override,
+    })).toBe(false);
+  });
+
+  test('rejects a closing owner even while identity still matches', () => {
+    const closing = { ...ownerSession, _closing: true };
+    expect(popupOwnerIsCurrent({
+      currentSession: closing,
+      ownerSession: closing,
+      popupContext: ownerContext,
+      ownerContext,
+      ownerGeneration: 'browser-1',
+    })).toBe(false);
+  });
+});
+
 describe('bounded orphan cleanup', () => {
   test('deduplicates cleanup while a page close is already in flight', async () => {
     const gate = deferred();
@@ -655,14 +697,11 @@ describe('bounded orphan cleanup', () => {
     }
   });
 
-  test('bounds a hanging escalation and self-retries with a fresh attempt', async () => {
+  test('bounds a permanently hanging escalation to one owned attempt', async () => {
     jest.useFakeTimers();
     try {
       const session = { browserGeneration: 'browser-1' };
-      const onEscalate = jest
-        .fn()
-        .mockImplementationOnce(() => new Promise(() => {}))
-        .mockResolvedValueOnce({ terminated: true, ownerEpoch: 'browser-1' });
+      const onEscalate = jest.fn(() => new Promise(() => {}));
       const tracker = new OrphanPageCleanup({
         closePage: jest.fn(async () => false),
         maxAttempts: 1,
@@ -677,10 +716,10 @@ describe('bounded orphan cleanup', () => {
       await expect(cleanup).resolves.toBe(false);
       expect(tracker.owns(page)).toBe(true);
 
-      await jest.advanceTimersByTimeAsync(10);
+      await jest.advanceTimersByTimeAsync(100);
       await flush();
-      expect(onEscalate).toHaveBeenCalledTimes(2);
-      expect(tracker.owns(page)).toBe(false);
+      expect(onEscalate).toHaveBeenCalledTimes(1);
+      expect(tracker.owns(page)).toBe(true);
     } finally {
       jest.useRealTimers();
     }
