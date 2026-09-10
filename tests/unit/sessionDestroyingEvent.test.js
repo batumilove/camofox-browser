@@ -26,9 +26,9 @@ describe('session:destroying event ordering', () => {
    *   3. pluginEvents.emitAsync('session:destroyed', ...)
    */
   async function simulateCloseSession(pluginEvents, session, userId, reason) {
-    await pluginEvents.emitAsync('session:destroying', { userId, reason, session, context: session.context });
+    await pluginEvents.emitAsyncSettled('session:destroying', { userId, reason, session, context: session.context });
     await session.context.close();
-    await pluginEvents.emitAsync('session:destroyed', { userId, reason, session, context: session.context });
+    await pluginEvents.emitAsyncSettled('session:destroyed', { userId, reason, session, context: session.context });
   }
 
   function makeMockContext() {
@@ -124,14 +124,27 @@ describe('session:destroying event ordering', () => {
       destroyedCalled = true;
     });
 
-    // emitAsync uses Promise.all which rejects on first error,
-    // but the real server.js should handle this. Test the behavior.
-    await expect(simulateCloseSession(events, session, 'user-1', 'test'))
-      .rejects.toThrow('plugin exploded');
+    await expect(simulateCloseSession(events, session, 'user-1', 'test')).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(destroyedCalled).toBe(true);
+  });
 
-    // With Promise.all, destroyed won't fire if destroying rejects.
-    // This documents the current behavior -- server.js should wrap in try/catch.
-    expect(destroyedCalled).toBe(false);
+  test('destroyed still fires if a destroying listener throws synchronously', async () => {
+    const events = createPluginEvents();
+    const context = makeMockContext();
+    const session = { context };
+    let destroyedCalled = false;
+
+    events.on('session:destroying', () => {
+      throw new Error('synchronous plugin explosion');
+    });
+    events.on('session:destroyed', () => {
+      destroyedCalled = true;
+    });
+
+    await expect(simulateCloseSession(events, session, 'user-1', 'test')).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(destroyedCalled).toBe(true);
   });
 
   test('multiple plugins can checkpoint during destroying', async () => {
