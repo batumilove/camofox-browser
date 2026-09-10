@@ -22,6 +22,26 @@ async function flush() {
 }
 
 describe('TabAdmissionController', () => {
+  test('snapshot reports pending counts per user without exposing operations', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 4,
+    });
+    const gate = deferred();
+    const active = controller.run('user-a', () => gate.promise);
+    const queuedA = controller.run('user-a', async () => 'a');
+    const queuedB = controller.run('user-b', async () => 'b');
+    await flush();
+
+    expect(controller.snapshot().pendingByUser).toEqual({ 'user-a': 1, 'user-b': 1 });
+
+    gate.resolve('done');
+    await expect(active).resolves.toBe('done');
+    await expect(queuedA).resolves.toBe('a');
+    await expect(queuedB).resolves.toBe('b');
+  });
+
   test('enforces the global active limit and starts queued work after release', async () => {
     const controller = new TabAdmissionController({ maxActive: 2, maxActivePerUser: 2, maxPending: 4 });
     const gates = [deferred(), deferred(), deferred()];

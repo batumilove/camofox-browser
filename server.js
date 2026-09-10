@@ -38,6 +38,7 @@ import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
 import { BrowserLaunchCoordinator } from './lib/browser-launch-coordinator.js';
+import { collectUserDiagnostics } from './lib/user-diagnostics.js';
 import {
   TabAdmissionController,
   TabCapacityReservations,
@@ -5121,6 +5122,57 @@ app.delete('/sessions/:userId', authMiddleware(), async (req, res) => {
     log('error', 'session close failed', { error: err.message });
     handleRouteError(err, req, res);
   }
+});
+
+/**
+ * @openapi
+ * /sessions/{userId}/diagnostics:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Read per-user session and tab diagnostics
+ *     description: Returns in-memory identifiers and counters scoped to one user. It never launches or awaits the browser and omits URLs, titles, cookies, and page content.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Per-user diagnostics, including admission state even when no session exists.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required: [userId, generatedAt, session, admission, concurrency, locks, tabs]
+ *               properties:
+ *                 userId: { type: string }
+ *                 generatedAt: { type: integer }
+ *                 session: { type: object }
+ *                 admission: { type: object }
+ *                 concurrency: { type: object }
+ *                 locks: { type: object }
+ *                 tabs:
+ *                   type: array
+ *                   items: { type: object }
+ *       403:
+ *         description: Authentication required.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/sessions/:userId/diagnostics', authMiddleware(), (req, res) => {
+  const userId = normalizeUserId(req.params.userId);
+  res.json(collectUserDiagnostics({
+    userId,
+    sessions,
+    tabLocks,
+    userConcurrency,
+    admissionSnapshot: tabAdmission.snapshot(),
+  }));
 });
 
 // Cleanup stale sessions
