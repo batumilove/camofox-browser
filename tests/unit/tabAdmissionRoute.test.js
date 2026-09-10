@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, jest, test } from '@jest/globals';
-import { TabAdmissionController, TabAdmissionError } from '../../lib/tab-admission.js';
+import {
+  TabAdmissionController,
+  TabAdmissionError,
+  createTabAdmissionShutdownError,
+} from '../../lib/tab-admission.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverSrc = readFileSync(join(here, '..', '..', 'server.js'), 'utf8');
@@ -49,6 +53,15 @@ describe('POST /tabs admission recovery', () => {
       retryAfter: 2,
     });
     expect(error).toMatchObject({ statusCode: 429, code: 'tab_admission_wait_timeout', retryAfter: 2 });
+  });
+
+  test('launch shutdown errors are behaviorally fixed at 503 with code and retry value', () => {
+    expect(createTabAdmissionShutdownError(7)).toMatchObject({
+      statusCode: 503,
+      code: 'tab_admission_shutting_down',
+      retryAfter: 7,
+    });
+    expect(serverSrc).toMatch(/if \(tabAdmission\.closed\)[\s\S]*throw createTabAdmissionShutdownError\(CONFIG\.tabAdmissionRetryAfter\)/);
   });
 
   test('waiting requests stay bounded globally and per user', async () => {
@@ -110,5 +123,11 @@ describe('POST /tabs admission recovery', () => {
     expect(serverSrc).toContain("from './lib/tab-admission.js'");
     expect(serverSrc).toMatch(/app\.post\('\/tabs'[\s\S]*tabAdmission\.run\(/);
     expect(serverSrc).toMatch(/TabAdmissionError[\s\S]*Retry-After/);
+  });
+
+  test('legacy POST /tabs/open cannot bypass admission or error serialization', () => {
+    const route = serverSrc.match(/app\.post\('\/tabs\/open'[\s\S]*?\n}\);/)?.[0] ?? '';
+    expect(route).toContain('tabAdmission.run(userId');
+    expect(route).toMatch(/instanceof TabAdmissionError[\s\S]*Retry-After/);
   });
 });

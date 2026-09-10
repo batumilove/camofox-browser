@@ -71,8 +71,10 @@ export async function register(app, ctx, pluginConfig = {}) {
   // checkpoint per user. Resetting users skip new work until teardown completes.
   const activeSessions = new Map(); // userId -> context
   const checkpointQueues = new Map(); // userId -> { running, pending }
-  const checkpointPromises = new Map(); // userId -> bounded queue-drain promise
+  const checkpointPromises = new Map(); // userId -> queue-drain promise (may outlive caller timeout)
   const resettingUsers = new Set();
+  const checkpointEpochs = new Map();
+  const publicationTails = new Map();
   const checkpointTimeoutMs = Number.isFinite(Number(pluginConfig.checkpointTimeoutMs))
     ? Math.max(1, Number(pluginConfig.checkpointTimeoutMs))
     : 5000;
@@ -89,19 +91,42 @@ export async function register(app, ctx, pluginConfig = {}) {
     ]).finally(() => clearTimeout(timer));
   }
 
-  async function persistCheckpoint({ userId, context, reason, storageState }) {
+  function bumpCheckpointEpoch(userId) {
+    const epoch = (checkpointEpochs.get(userId) || 0) + 1;
+    checkpointEpochs.set(userId, epoch);
+    return epoch;
+  }
+
+  async function withPublicationLock(userId, operation) {
+    const previous = publicationTails.get(userId) || Promise.resolve();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    publicationTails.set(userId, gate);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (publicationTails.get(userId) === gate) publicationTails.delete(userId);
+    }
+  }
+
+  async function persistCheckpoint({ userId, context, reason, storageState, epoch }) {
     if (resettingUsers.has(userId)) return undefined;
-    const result = await withCheckpointTimeout(persistStorageState({
+    const result = await persistStorageState({
       profileDir,
       userId,
       context,
       storageState,
       shouldPublish: context
-        ? () => !resettingUsers.has(userId) && activeSessions.get(userId) === context
-        : () => !resettingUsers.has(userId),
+        ? () => !resettingUsers.has(userId)
+          && (checkpointEpochs.get(userId) || 0) === epoch
+          && activeSessions.get(userId) === context
+        : () => !resettingUsers.has(userId) && (checkpointEpochs.get(userId) || 0) === epoch,
+      publish: operation => withPublicationLock(userId, operation),
       logger,
       indexedDB,
-    }), userId, reason);
+    });
     if (result.persisted) {
       log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
     }
@@ -145,25 +170,28 @@ export async function register(app, ctx, pluginConfig = {}) {
       queue.pending.context = context;
       queue.pending.reason = reason;
       queue.pending.storageState = storageState;
+      queue.pending.epoch = checkpointEpochs.get(userId) || 0;
       return queue.pending.promise;
     }
     let resolveRequest;
     let rejectRequest;
-    const promise = new Promise((resolve, reject) => {
+    const completion = new Promise((resolve, reject) => {
       resolveRequest = resolve;
       rejectRequest = reject;
     });
-    queue.pending = {
+    const request = {
       userId,
       context,
       reason,
       storageState,
-      promise,
+      epoch: checkpointEpochs.get(userId) || 0,
+      promise: withCheckpointTimeout(completion, userId, reason),
       resolve: resolveRequest,
       reject: rejectRequest,
     };
+    queue.pending = request;
     startCheckpointDrain(userId, queue);
-    return promise;
+    return request.promise;
   }
 
   // --- Lifecycle hooks ---
@@ -171,7 +199,10 @@ export async function register(app, ctx, pluginConfig = {}) {
   // Before session context is created: inject storageState if we have one saved
   events.on('session:creating', async ({ userId, contextOptions }) => {
     if (resettingUsers.has(userId)) return;
-    const storageStatePath = await loadPersistedStorageState(profileDir, userId, logger);
+    const storageStatePath = await withPublicationLock(userId, async () => {
+      bumpCheckpointEpoch(userId);
+      return loadPersistedStorageState(profileDir, userId, logger);
+    });
     if (storageStatePath) {
       contextOptions.storageState = storageStatePath;
       log('info', 'restoring persisted storage state', { userId, storageStatePath });
@@ -181,6 +212,7 @@ export async function register(app, ctx, pluginConfig = {}) {
   // After session is created: import bootstrap cookies if no persisted state,
   // and track the context for later checkpointing
   events.on('session:created', async ({ userId, context }) => {
+    bumpCheckpointEpoch(userId);
     activeSessions.set(userId, context);
 
     // If no persisted state was restored, try bootstrap cookies
@@ -231,9 +263,8 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // On shutdown: checkpoint all remaining sessions
   events.on('server:shutdown', async () => {
-    for (const [userId, context] of activeSessions) {
-      await checkpoint(userId, context, 'shutdown').catch(() => {});
-    }
+    await Promise.allSettled([...activeSessions].map(([userId, context]) =>
+      checkpoint(userId, context, 'shutdown')));
     activeSessions.clear();
   });
 
@@ -246,11 +277,13 @@ export async function register(app, ctx, pluginConfig = {}) {
     resettingUsers.add(userId);
     try {
       const clearedLive = await ctx.destroySession(userId, { reason: 'storage_reset' });
-      await checkpointPromises.get(userId)?.catch(() => {});
-
-      const { storageStatePath, metaPath } = getUserPersistencePaths(profileDir, userId);
-      const removedPersisted = await removeIfExists(storageStatePath);
-      await removeIfExists(metaPath);
+      const removedPersisted = await withPublicationLock(userId, async () => {
+        bumpCheckpointEpoch(userId);
+        const { storageStatePath, metaPath } = getUserPersistencePaths(profileDir, userId);
+        const removed = await removeIfExists(storageStatePath);
+        await removeIfExists(metaPath);
+        return removed;
+      });
 
       log('info', 'session storage state reset', {
         reqId: req.reqId,

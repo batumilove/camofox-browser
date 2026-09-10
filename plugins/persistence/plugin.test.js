@@ -197,7 +197,7 @@ describe('persistence plugin', () => {
     });
   });
 
-  test('DELETE storage_state waits for an in-flight checkpoint before deleting', async () => {
+  test('DELETE storage_state invalidates an in-flight checkpoint without waiting for serialization', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
     const handler = mockApp.delete.mock.calls
       .find(c => c[0] === '/sessions/:userId/storage_state')
@@ -219,12 +219,15 @@ describe('persistence plugin', () => {
     await checkpointStarted;
 
     const res = { json: jest.fn(), status: jest.fn(function () { return this; }) };
-    const reset = handler({ params: { userId: 'user-race' } }, res);
-    await Promise.resolve();
-    expect(res.json).not.toHaveBeenCalled();
+    const outcome = await Promise.race([
+      handler({ params: { userId: 'user-race' } }, res).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('blocked'), 200)),
+    ]);
+    expect(outcome).toBe('completed');
+    expect(res.json).toHaveBeenCalled();
 
     finishCheckpoint();
-    await Promise.all([checkpoint, reset]);
+    await checkpoint;
 
     const { getUserPersistencePaths } = await import('../../lib/persistence.js');
     const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-race');
@@ -255,6 +258,69 @@ describe('persistence plugin', () => {
     releaseFirst();
     await Promise.all(writes);
     expect(mockContext.storageState).toHaveBeenCalledTimes(2);
+  });
+
+  test('timed-out checkpoints retain serialization ownership before the latest write', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir, checkpointTimeoutMs: 100 });
+    let releaseFirst;
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+    let firstStartedResolve;
+    const firstStarted = new Promise(resolve => { firstStartedResolve = resolve; });
+    const mockContext = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        const call = mockContext.storageState.mock.calls.length;
+        if (call === 1) {
+          firstStartedResolve();
+          await firstBlocked;
+        }
+        await fs.writeFile(targetPath, JSON.stringify({
+          cookies: [{ name: call === 1 ? 'old' : 'latest', value: '1' }],
+          origins: [],
+        }));
+      }),
+    };
+    await events.emitAsync('session:created', { userId: 'serialized', context: mockContext });
+    const first = events.emitAsync('session:cookies:import', { userId: 'serialized' });
+    await firstStarted;
+    await expect(first).rejects.toThrow('storage checkpoint timed out');
+
+    const second = events.emitAsync('session:cookies:import', { userId: 'serialized' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(mockContext.storageState).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await second;
+    expect(mockContext.storageState).toHaveBeenCalledTimes(2);
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'serialized');
+    expect(JSON.parse(await fs.readFile(storageStatePath, 'utf8')).cookies[0].name).toBe('latest');
+  });
+
+  test('shutdown starts all user checkpoints in parallel within one timeout window', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir, checkpointTimeoutMs: 20 });
+    let started = 0;
+    let resolveAllStarted;
+    const allStarted = new Promise(resolve => { resolveAllStarted = resolve; });
+    const makeContext = () => ({
+      storageState: jest.fn(() => {
+        started += 1;
+        if (started === 2) resolveAllStarted();
+        return new Promise(() => {});
+      }),
+    });
+    const contextA = makeContext();
+    const contextB = makeContext();
+    await events.emitAsync('session:created', { userId: 'shutdown-a', context: contextA });
+    await events.emitAsync('session:created', { userId: 'shutdown-b', context: contextB });
+
+    const shutdown = events.emitAsync('server:shutdown');
+    await expect(Promise.race([
+      allStarted.then(() => 'all-started'),
+      new Promise(resolve => setTimeout(() => resolve('serial'), 100)),
+    ])).resolves.toBe('all-started');
+    await shutdown;
+    expect(contextA.storageState).toHaveBeenCalledTimes(1);
+    expect(contextB.storageState).toHaveBeenCalledTimes(1);
   });
 
   test('storage reset is bounded when storage serialization hangs', async () => {

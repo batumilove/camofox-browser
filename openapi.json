@@ -2798,6 +2798,28 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Tab admission is saturated or timed out.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Tab admission is shutting down.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         }
       }

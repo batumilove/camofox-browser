@@ -3,10 +3,11 @@ import os from 'os';
 import path from 'path';
 import {
   signalOwnedProcess,
-  snapshotOwnedProcessDescendants,
+  snapshotOwnedProcessTreesByExecutable,
   snapshotOwnedBrowserProcesses,
   survivingOwnedBrowserProcesses,
   profilePathsFromProcessSnapshot,
+  terminateOwnedProcess,
 } from '../../lib/process-ownership.js';
 
 function proc(root, pid, ppid, cmdline, startTime = '10', comm = 'test') {
@@ -59,19 +60,42 @@ test('explicit owned roots capture custom browser and Xvfb executable names', ()
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('launch snapshots find new owned descendants without browser.process()', () => {
+test('launch snapshots include only the exact executable tree, not concurrent helpers', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
   proc(root, 100, 1, 'node\0server.js');
   proc(root, 101, 100, '/usr/bin/existing-helper');
-  const before = snapshotOwnedProcessDescendants(100, root);
   proc(root, 102, 100, '/opt/custom/browser-enterprise');
   proc(root, 103, 102, 'GeckoChildProcess\0-contentproc');
-  const seen = new Set(before.map(p => `${p.pid}:${p.startTime}`));
-  const launched = snapshotOwnedProcessDescendants(100, root)
-    .filter(p => !seen.has(`${p.pid}:${p.startTime}`));
+  proc(root, 104, 100, '/usr/bin/yt-dlp\0https://example.test');
+  const launched = snapshotOwnedProcessTreesByExecutable(
+    100,
+    '/opt/custom/browser-enterprise',
+    root,
+  );
 
   expect(launched.map(p => p.pid)).toEqual([102, 103]);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('owned-process termination escalates TERM survivors with generation-safe signaling', () => {
+  const identity = { pid: 101, startTime: '10' };
+  const signals = [];
+  let escalation;
+  expect(terminateOwnedProcess(identity, {
+    graceMs: 25,
+    signalOwned: (processIdentity, signalName) => {
+      signals.push([processIdentity, signalName]);
+      return true;
+    },
+    setTimer: (callback, delay) => {
+      escalation = callback;
+      expect(delay).toBe(25);
+      return { unref() {} };
+    },
+  })).toBe(true);
+  expect(signals).toEqual([[identity, 'SIGTERM']]);
+  escalation();
+  expect(signals).toEqual([[identity, 'SIGTERM'], [identity, 'SIGKILL']]);
 });
 
 test('only captured descendants survive reparenting; unrelated PID 1 browsers do not', () => {
@@ -133,12 +157,13 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   const source = fs.readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
   const displayClass = source.match(/class DefaultVirtualDisplay[\s\S]*?\n}\n\nlet virtualDisplay/)?.[0] ?? '';
   const survivorCleanup = source.match(/async function _forceKillBrowserProcesses[\s\S]*?\n}\n/)?.[0] ?? '';
-  expect(displayClass).toContain('signalOwnedProcess(');
+  expect(displayClass).toContain('terminateOwnedProcess(');
   expect(survivorCleanup).toContain('signalOwnedProcess(');
   expect(displayClass).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', this\.proc\?\.pid\)/);
   expect(source).toMatch(/snapshotOwnedBrowserProcesses\(process\.pid, '\/proc', pid\)/);
-  expect(source).toContain('snapshotOwnedProcessDescendants(process.pid)');
+  expect(source).toContain('snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)');
+  expect(source).toContain('VirtualDisplay: DefaultVirtualDisplay');
   expect(source).toMatch(/candidateBrowser\.close = async[\s\S]*?finally/);
   expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*server\.close/);
-  expect(source).toMatch(/if \(tabAdmission\.closed\)[\s\S]*tab_admission_shutting_down[\s\S]*virtualDisplay = localVirtualDisplay/);
+  expect(source).toMatch(/if \(tabAdmission\.closed\)[\s\S]*createTabAdmissionShutdownError\([\s\S]*virtualDisplay = localVirtualDisplay/);
 });

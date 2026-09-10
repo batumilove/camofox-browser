@@ -54,9 +54,11 @@ import {
   signalOwnedProcess,
   snapshotOwnedBrowserProcesses,
   snapshotOwnedProcessDescendants,
+  snapshotOwnedProcessTreesByExecutable,
   survivingOwnedBrowserProcesses,
+  terminateOwnedProcess,
 } from './lib/process-ownership.js';
-import { TabAdmissionController, TabAdmissionError } from './lib/tab-admission.js';
+import { TabAdmissionController, TabAdmissionError, createTabAdmissionShutdownError } from './lib/tab-admission.js';
 import { createSessionCloseCoordinator } from './lib/session-close.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
@@ -912,7 +914,7 @@ class DefaultVirtualDisplay extends VirtualDisplay {
     this.proc = null;
     this.ownedProcessIdentity = null;
     if (!identity) return false;
-    return signalOwnedProcess(identity, 'SIGTERM');
+    return terminateOwnedProcess(identity);
   }
 }
 
@@ -1153,12 +1155,7 @@ async function launchBrowserInstance() {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (tabAdmission.closed) {
-      throw new TabAdmissionError(
-        'Tab admission is shutting down',
-        'tab_admission_shutting_down',
-        CONFIG.tabAdmissionRetryAfter,
-        503,
-      );
+      throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
     }
     const launchProxy = proxyPool
       ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
@@ -1170,6 +1167,7 @@ async function launchBrowserInstance() {
     let candidateBrowser = null;
     let launchBaseline = null;
     let candidateOwnedProcesses = [];
+    let browserExecutablePath = null;
     try {
       if (os.platform() === 'linux' && !useDesktopWindow) {
         localVirtualDisplay = virtualDisplayRegistry.create();
@@ -1227,13 +1225,17 @@ async function launchBrowserInstance() {
       options.handleSIGINT = false;
       options.handleSIGHUP = false;
       await pluginEvents.emitAsync('browser:launching', { options });
+      browserExecutablePath = options.executablePath;
 
       launchBaseline = new Set(
         snapshotOwnedProcessDescendants(process.pid).map(proc => `${proc.pid}:${proc.startTime}`),
       );
       candidateBrowser = await firefox.launch(options);
-      candidateOwnedProcesses = snapshotOwnedProcessDescendants(process.pid)
+      candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)
         .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
+      if (os.platform() === 'linux' && candidateOwnedProcesses.length === 0) {
+        throw new Error(`Unable to identify launched browser process tree for ${browserExecutablePath}`);
+      }
       attachBrowserCleanup(candidateBrowser, localVirtualDisplay);
 
       if (proxyPool?.canRotateSessions) {
@@ -1263,12 +1265,7 @@ async function launchBrowserInstance() {
       // outer launch timeout) must not publish a fresh browser during shutdown.
       // The catch path below closes the candidate and kills its captured tree.
       if (tabAdmission.closed) {
-        throw new TabAdmissionError(
-          'Tab admission is shutting down',
-          'tab_admission_shutting_down',
-          CONFIG.tabAdmissionRetryAfter,
-          503,
-        );
+        throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
       }
 
       virtualDisplay = localVirtualDisplay;
@@ -1300,7 +1297,7 @@ async function launchBrowserInstance() {
       });
       await candidateBrowser?.close().catch(() => {});
       if (launchBaseline) {
-        candidateOwnedProcesses = snapshotOwnedProcessDescendants(process.pid)
+        candidateOwnedProcesses = snapshotOwnedProcessTreesByExecutable(process.pid, browserExecutablePath)
           .filter(proc => !launchBaseline.has(`${proc.pid}:${proc.startTime}`));
       }
       await _forceKillBrowserProcesses('launch_attempt_failed', candidateOwnedProcesses);
@@ -6353,6 +6350,20 @@ app.get('/tabs', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Tab admission is saturated or timed out.
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying.
+ *             schema:
+ *               type: integer
+ *       503:
+ *         description: Tab admission is shutting down.
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying.
+ *             schema:
+ *               type: integer
  */
 app.post('/tabs/open', async (req, res) => {
   try {
@@ -6366,8 +6377,9 @@ app.post('/tabs/open', async (req, res) => {
     
     const urlErr = validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
-    
-    let session = await getSession(userId);
+
+    const result = await tabAdmission.run(userId, async () => {
+      let session = await getSession(userId);
     
     // Recycle oldest tab when limits are reached instead of rejecting
     let totalTabs = 0;
@@ -6375,7 +6387,7 @@ app.post('/tabs/open', async (req, res) => {
     if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
       const recycled = await recycleOldestTab(session, req.reqId, userId);
       if (!recycled) {
-        return res.status(429).json({ error: 'Maximum tabs per session reached' });
+        throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
       }
     }
     
@@ -6425,15 +6437,25 @@ app.post('/tabs/open', async (req, res) => {
     tabState.visitedUrls.add(url);
     
     log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
-    res.json({ 
-      ok: true,
-      targetId: tabId,
-      tabId,
-      url: page.url(),
-      title: await page.title().catch(() => '')
+      return {
+        ok: true,
+        targetId: tabId,
+        tabId,
+        url: page.url(),
+        title: await page.title().catch(() => ''),
+      };
     });
+    res.json(result);
   } catch (err) {
     log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
+    if (err instanceof TabAdmissionError) {
+      res.set('Retry-After', String(err.retryAfter));
+      return res.status(err.statusCode).json({
+        error: err.message,
+        code: err.code,
+        retryAfter: err.retryAfter,
+      });
+    }
     handleRouteError(err, req, res);
   }
 });
@@ -7157,8 +7179,8 @@ const pluginCtx = {
   metricsRegistry: getRegister,
   createMetric,
   registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
-  /** The upstream VirtualDisplay class -- plugins can subclass it. */
-  VirtualDisplay,
+  /** Hardened display class; plugin subclasses retain owned-process cleanup. */
+  VirtualDisplay: DefaultVirtualDisplay,
 };
 const loadedPlugins = await loadPlugins(app, pluginCtx);
 
