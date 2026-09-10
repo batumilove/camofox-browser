@@ -42,6 +42,7 @@ import {
   TabAdmissionController,
   TabCapacityReservations,
   canReapEmptySession,
+  detachSessionForClose,
   reservePendingTabCreation,
   sendTabAdmissionError,
   withAbortableResource,
@@ -1239,6 +1240,10 @@ async function closeSession(userId, session, {
   if (!session) return;
 
   const key = normalizeUserId(userId);
+  // Detach synchronously so a hung context.close() cannot leave an internal
+  // _closing session resident. Identity checking protects a newer session
+  // installed under the same user key from late teardown of the old one.
+  detachSessionForClose(sessions, key, session);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
@@ -1261,7 +1266,6 @@ async function closeSession(userId, session, {
   }
 
   await session.context.close().catch(() => {});
-  sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
 
   refreshActiveTabsGauge();
