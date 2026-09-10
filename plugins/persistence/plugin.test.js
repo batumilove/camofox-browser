@@ -186,6 +186,38 @@ describe('persistence plugin', () => {
     expect(saved.cookies[0].name).toBe('current-b');
   });
 
+  test('newer checkpoint from the same context wins over an older slow checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseOld, markOldStarted;
+    const oldStarted = new Promise((resolve) => { markOldStarted = resolve; });
+    const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+    let call = 0;
+    const context = {
+      storageState: jest.fn(async ({ path: p }) => {
+        call += 1;
+        if (call === 1) {
+          markOldStarted();
+          await oldGate;
+          await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'older' }], origins: [] }));
+          return;
+        }
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'newer' }], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'same-context', context });
+    const older = events.emitAsync('session:cookies:import', { userId: 'same-context', context });
+    await oldStarted;
+    await events.emitAsync('session:cookies:import', { userId: 'same-context', context });
+    releaseOld();
+    await older;
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'same-context');
+    const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(saved.cookies[0].name).toBe('newer');
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;

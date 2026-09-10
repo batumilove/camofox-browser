@@ -48,18 +48,29 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // Track active sessions for checkpoint on close
   const activeSessions = new Map(); // userId -> context
+  const checkpointSequences = new Map(); // userId -> latest requested checkpoint generation
+
+  function advanceCheckpointSequence(userId) {
+    const sequence = (checkpointSequences.get(userId) || 0) + 1;
+    checkpointSequences.set(userId, sequence);
+    return sequence;
+  }
 
   /**
    * Checkpoint storage state to disk for a userId.
    */
   async function checkpoint(userId, context, reason) {
     if (!context) return;
+    const sequence = advanceCheckpointSequence(userId);
     const result = await persistStorageState({
       profileDir,
       userId,
       context,
       logger,
-      shouldPublish: () => activeSessions.get(userId) === context,
+      shouldPublish: () => (
+        activeSessions.get(userId) === context
+        && checkpointSequences.get(userId) === sequence
+      ),
     });
     if (result.persisted) {
       log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
@@ -81,6 +92,8 @@ export async function register(app, ctx, pluginConfig = {}) {
   // After session is created: import bootstrap cookies if no persisted state,
   // and track the context for later checkpointing
   events.on('session:created', async ({ userId, context }) => {
+    // Invalidate any late checkpoint from the previous session generation.
+    advanceCheckpointSequence(userId);
     activeSessions.set(userId, context);
 
     // If no persisted state was restored, try bootstrap cookies
@@ -113,7 +126,10 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // On session destroyed (post-close): cleanup tracking if not already done
   events.on('session:destroyed', async ({ userId, context }) => {
-    if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
+    if (context && activeSessions.get(userId) === context) {
+      advanceCheckpointSequence(userId);
+      activeSessions.delete(userId);
+    }
   });
 
   // Shutdown checkpoints are owned by session:destroying while contexts are alive.
