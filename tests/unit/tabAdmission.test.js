@@ -114,7 +114,7 @@ describe('TabAdmissionController', () => {
     expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
   });
 
-  test('times out active work, aborts it, and releases only after late settlement', async () => {
+  test('times out active work, aborts it, and releases before late settlement', async () => {
     jest.useFakeTimers();
     try {
       const controller = new TabAdmissionController({
@@ -136,11 +136,11 @@ describe('TabAdmissionController', () => {
       await jest.advanceTimersByTimeAsync(100);
       await firstRejection;
       expect(signal.aborted).toBe(true);
-      expect(controller.snapshot()).toMatchObject({ active: 1, pending: 1 });
+      await expect(second).resolves.toBe('next');
+      expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
 
       late.resolve('ignored');
       await flush();
-      await expect(second).resolves.toBe('next');
       expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
     } finally {
       jest.useRealTimers();
