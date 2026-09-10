@@ -48,6 +48,7 @@ import {
   releaseOnAbort,
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
+  runBoundedSessionTeardown,
   sendTabAdmissionError,
   withAbortableResource,
 } from './lib/tab-admission.js';
@@ -1253,35 +1254,46 @@ async function closeSession(userId, session, {
     clearSessionLocks(session);
   }
 
-  if (clearDownloads) {
-    await clearSessionDownloads(session).catch(() => {});
-  }
-
-  await pluginEvents.emitAsyncSettled('session:destroying', {
-    userId: key,
-    reason,
-    session,
-    context: session.context,
-  }, (err) => {
-    log('warn', 'session:destroying plugin failed', { userId: key, reason, error: err?.message || String(err) });
-  });
+  const payload = { userId: key, reason, session, context: session.context };
+  const steps = [];
+  if (clearDownloads) steps.push(['session download cleanup', () => clearSessionDownloads(session)]);
+  steps.push(['session:destroying', () => pluginEvents.emitAsyncSettled(
+    'session:destroying',
+    payload,
+    (err) => log('warn', 'session:destroying plugin failed', {
+      userId: key,
+      reason,
+      error: err?.message || String(err),
+    }),
+  )]);
   if (session.tracePath) {
-    try {
-      await session.context.tracing.stop({ path: session.tracePath });
-      log('info', 'tracing saved', { userId: key, path: session.tracePath });
-    } catch (err) {
-      log('warn', 'tracing.stop failed', { userId: key, error: err.message });
-    }
+    steps.push(['tracing.stop', () => session.context.tracing.stop({ path: session.tracePath })]);
   }
 
-  await session.context.close().catch(() => {});
-  await pluginEvents.emitAsyncSettled('session:destroyed', {
-    userId: key,
-    reason,
-    session,
-    context: session.context,
-  }, (err) => {
-    log('warn', 'session:destroyed plugin failed', { userId: key, reason, error: err?.message || String(err) });
+  await runBoundedSessionTeardown({
+    steps,
+    closeContext: () => session.context.close(),
+    emitDestroyed: () => pluginEvents.emitAsyncSettled(
+      'session:destroyed',
+      payload,
+      (err) => log('warn', 'session:destroyed plugin failed', {
+        userId: key,
+        reason,
+        error: err?.message || String(err),
+      }),
+    ),
+    timeoutMs: 2000,
+    onSettlement: (name, result) => {
+      if (result.status === 'fulfilled') {
+        if (name === 'tracing.stop') log('info', 'tracing saved', { userId: key, path: session.tracePath });
+        return;
+      }
+      log('warn', `${name} ${result.status === 'timeout' ? 'timed out' : 'failed'}`, {
+        userId: key,
+        reason,
+        ...(result.reason ? { error: result.reason?.message || String(result.reason) } : {}),
+      });
+    },
   });
 
   refreshActiveTabsGauge();

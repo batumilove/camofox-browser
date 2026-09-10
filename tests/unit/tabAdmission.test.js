@@ -7,7 +7,9 @@ import {
   closePageWithin,
   replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
+  runBoundedSessionTeardown,
   sendTabAdmissionError,
+  settleWithin,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
 
@@ -370,6 +372,53 @@ describe('awaitAbortableResource', () => {
 });
 
 describe('bounded timeout cleanup helpers', () => {
+  test('continues teardown after hung steps and synchronous close failure', async () => {
+    jest.useFakeTimers();
+    try {
+      const calls = [];
+      const teardown = runBoundedSessionTeardown({
+        steps: [
+          ['session:destroying', () => new Promise(() => {})],
+          ['tracing.stop', async () => { calls.push('tracing.stop'); }],
+        ],
+        closeContext: () => {
+          calls.push('context.close');
+          throw new Error('close exploded');
+        },
+        emitDestroyed: async () => { calls.push('session:destroyed'); },
+        timeoutMs: 25,
+      });
+
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(teardown).resolves.toBeUndefined();
+      expect(calls).toEqual(['tracing.stop', 'context.close', 'session:destroyed']);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('returns after hung context close and hung destroyed listener', async () => {
+    jest.useFakeTimers();
+    try {
+      const settlements = [];
+      const teardown = runBoundedSessionTeardown({
+        closeContext: () => new Promise(() => {}),
+        emitDestroyed: () => new Promise(() => {}),
+        timeoutMs: 25,
+        onSettlement: (name, result) => settlements.push([name, result.status]),
+      });
+
+      await jest.advanceTimersByTimeAsync(50);
+      await expect(teardown).resolves.toBeUndefined();
+      expect(settlements).toEqual([
+        ['context.close', 'timeout'],
+        ['session:destroyed', 'timeout'],
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('a hung page close is attempted once and returns at the cleanup deadline', async () => {
     jest.useFakeTimers();
     try {
