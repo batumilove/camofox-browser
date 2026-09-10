@@ -46,7 +46,7 @@ describe('collectUserDiagnostics', () => {
     expect(result).toMatchObject({
       userId: 'user-a',
       session: { exists: true, closing: false, idleMs: 1_000, pendingTabCreations: 0, tabCount: 1 },
-      admission: { activeForUser: 1, pendingForUser: 2, activeGlobal: 2, pendingGlobal: 3, activeWithoutSession: false },
+      admission: { activeForUser: 1, pendingForUser: 2, activeWithoutSession: false },
       concurrency: { activeForUser: 1, queuedForUser: 1 },
       locks: { activeForUser: 1, queuedForUser: 2 },
       tabs: [{ tabId: 'tab-a', sessionKey: 'session-a', lock: { active: true, queued: 2 }, toolCalls: 4 }],
@@ -56,6 +56,8 @@ describe('collectUserDiagnostics', () => {
     expect(serialized).not.toContain('secret-session-b');
     expect(serialized).not.toContain('must-not-leak.invalid');
     expect(serialized).not.toContain('lastRequestedUrl');
+    expect(result.admission).not.toHaveProperty('activeGlobal');
+    expect(result.admission).not.toHaveProperty('pendingGlobal');
   });
 
   test('reports admission held without a resident session', () => {
@@ -79,5 +81,39 @@ describe('collectUserDiagnostics', () => {
       admission: { activeForUser: 1, pendingForUser: 1, activeWithoutSession: true },
       tabs: [],
     });
+  });
+
+  test('bounds every response counter without losing requested-user identity', () => {
+    const hugeQueue = [];
+    hugeQueue.length = 1_000_000_001;
+    const result = collectUserDiagnostics({
+      userId: 'bounded-user',
+      now: 2_000,
+      sessions: new Map([['bounded-user', session([
+        ['bounded-session', new Map([['bounded-tab', tabState({
+          toolCalls: Number.MAX_SAFE_INTEGER,
+          consecutiveTimeouts: Number.MAX_SAFE_INTEGER,
+          consecutiveFailures: Number.MAX_SAFE_INTEGER,
+        })]])],
+      ], { _pendingTabCreations: Number.MAX_SAFE_INTEGER })]]),
+      tabLocks: new Map([['bounded-tab', { active: true, queue: hugeQueue }]]),
+      userConcurrency: new Map([['bounded-user', { active: Number.MAX_SAFE_INTEGER, queue: hugeQueue }]]),
+      admissionSnapshot: {
+        activeByUser: { 'bounded-user': Number.MAX_SAFE_INTEGER },
+        pendingByUser: { 'bounded-user': Number.MAX_SAFE_INTEGER },
+      },
+    });
+
+    expect(result.userId).toBe('bounded-user');
+    expect(result.session.pendingTabCreations).toBe(1_000_000_000);
+    expect(result.admission.activeForUser).toBe(1_000_000_000);
+    expect(result.admission.pendingForUser).toBe(1_000_000_000);
+    expect(result.concurrency.activeForUser).toBe(1_000_000_000);
+    expect(result.concurrency.queuedForUser).toBe(1_000_000_000);
+    expect(result.locks.queuedForUser).toBe(1_000_000_000);
+    expect(result.tabs[0].lock.queued).toBe(1_000_000_000);
+    expect(result.tabs[0].toolCalls).toBe(1_000_000_000);
+    expect(result.tabs[0].consecutiveTimeouts).toBe(1_000_000_000);
+    expect(result.tabs[0].consecutiveFailures).toBe(1_000_000_000);
   });
 });

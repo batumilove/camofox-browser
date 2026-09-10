@@ -175,6 +175,25 @@ describe('OpenAPI spec', () => {
     expect(op.security).toEqual([{ BearerAuth: [] }]);
   });
 
+  test('diagnostics schema documents only bounded per-user admission counters', () => {
+    const op = spec.paths['/sessions/{userId}/diagnostics']?.get;
+    expect(op).toBeDefined();
+    expect(op.security).toEqual([{ BearerAuth: [] }]);
+    const schema = op.responses[200].content['application/json'].schema;
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.admission.additionalProperties).toBe(false);
+    expect(schema.properties.admission.properties).toEqual(expect.objectContaining({
+      activeForUser: expect.objectContaining({ type: 'integer', maximum: 1_000_000_000 }),
+      pendingForUser: expect.objectContaining({ type: 'integer', maximum: 1_000_000_000 }),
+      activeWithoutSession: { type: 'boolean' },
+    }));
+    expect(schema.properties.admission.properties).not.toHaveProperty('activeGlobal');
+    expect(schema.properties.admission.properties).not.toHaveProperty('pendingGlobal');
+    expect(schema.properties.tabs.items.properties.toolCalls.maximum).toBe(1_000_000_000);
+    expect(schema.properties.tabs.items.properties.consecutiveTimeouts.maximum).toBe(1_000_000_000);
+    expect(schema.properties.tabs.items.properties.consecutiveFailures.maximum).toBe(1_000_000_000);
+  });
+
   test('$ref references resolve to existing component schemas', () => {
     const schemaNames = Object.keys(spec.components?.schemas || {});
     const refs = [];

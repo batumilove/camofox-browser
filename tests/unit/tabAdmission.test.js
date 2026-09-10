@@ -42,6 +42,30 @@ describe('TabAdmissionController', () => {
     await expect(queuedB).resolves.toBe('b');
   });
 
+  test('snapshot counts pending prototype-named user IDs as ordinary keys', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 4,
+    });
+    const gate = deferred();
+    const active = controller.run('active-user', () => gate.promise);
+    const queued = ['__proto__', 'constructor', 'toString'].map((user) => (
+      controller.run(user, async () => user)
+    ));
+    await flush();
+
+    const snapshot = controller.snapshot();
+    expect(Object.hasOwn(snapshot.pendingByUser, '__proto__')).toBe(true);
+    expect(snapshot.pendingByUser.__proto__).toBe(1);
+    expect(snapshot.pendingByUser.constructor).toBe(1);
+    expect(snapshot.pendingByUser.toString).toBe(1);
+
+    gate.resolve('done');
+    await expect(active).resolves.toBe('done');
+    await expect(Promise.all(queued)).resolves.toEqual(['__proto__', 'constructor', 'toString']);
+  });
+
   test('enforces the global active limit and starts queued work after release', async () => {
     const controller = new TabAdmissionController({ maxActive: 2, maxActivePerUser: 2, maxPending: 4 });
     const gates = [deferred(), deferred(), deferred()];
