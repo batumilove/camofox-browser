@@ -118,14 +118,16 @@ describe('createPageWithSessionRecovery', () => {
     const replacement = { id: 'replacement', context: { newPage: jest.fn().mockResolvedValue(page) } };
     const releases = new Map();
     const rawReleases = new Map();
+    const retireFinalizers = new Map();
     const reservePendingCreation = jest.fn(session => {
       const release = jest.fn();
       releases.set(session.id, release);
       return release;
     });
-    const reserveRawCreation = jest.fn(session => {
+    const reserveRawCreation = jest.fn((session, _label, { onRetire } = {}) => {
       const lease = { settle: jest.fn() };
       rawReleases.set(session.id, lease.settle);
+      retireFinalizers.set(session.id, onRetire);
       return lease;
     });
     const cleanupLatePage = jest.fn(() => cleanupGate);
@@ -149,6 +151,10 @@ describe('createPageWithSessionRecovery', () => {
     expect(releases.get('replacement')).toHaveBeenCalledTimes(1);
     expect(rawReleases.get('old')).not.toHaveBeenCalled();
     expect(rawReleases.get('replacement')).toHaveBeenCalledTimes(1);
+    expect(oldSession.pageLeases.size).toBe(1);
+
+    retireFinalizers.get('old')();
+    expect(oldSession.pageLeases.size).toBe(0);
 
     resolveOldPage(latePage);
     await oldPagePromise;

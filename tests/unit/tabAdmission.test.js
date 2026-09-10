@@ -330,12 +330,13 @@ describe('RawCreationRegistry', () => {
     }
   });
 
-  test('retries a rejected deadline handler without releasing raw-creation ownership', async () => {
+  test('retries every rejected deadline handler without releasing raw-creation ownership', async () => {
     jest.useFakeTimers();
     try {
       const onDeadline = jest
         .fn()
         .mockRejectedValueOnce(new Error('transient teardown failure'))
+        .mockRejectedValueOnce(new Error('later teardown failure'))
         .mockResolvedValueOnce(undefined);
       const registry = new RawCreationRegistry({
         maxOutstanding: 1,
@@ -353,11 +354,30 @@ describe('RawCreationRegistry', () => {
       expect(onDeadline).toHaveBeenCalledTimes(2);
       expect(registry.snapshot().outstanding).toBe(1);
 
+      await jest.advanceTimersByTimeAsync(25);
+      expect(onDeadline).toHaveBeenCalledTimes(3);
+      expect(registry.snapshot().outstanding).toBe(1);
+
       lease.settle();
       expect(registry.snapshot().outstanding).toBe(0);
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  test('retirement runs its finalizer once while normal settlement does not', () => {
+    const registry = new RawCreationRegistry({ maxOutstanding: 2, maxPerUser: 2 });
+    const settledFinalizer = jest.fn();
+    const settled = registry.acquire({ userKey: 'u1', onRetire: settledFinalizer });
+    expect(settled.settle()).toBe(true);
+    expect(settledFinalizer).not.toHaveBeenCalled();
+
+    const retiredFinalizer = jest.fn();
+    const retired = registry.acquire({ userKey: 'u1', onRetire: retiredFinalizer });
+    expect(retired.retire()).toBe(true);
+    expect(retired.retire()).toBe(false);
+    expect(retiredFinalizer).toHaveBeenCalledTimes(1);
+    expect(registry.snapshot().outstanding).toBe(0);
   });
 });
 

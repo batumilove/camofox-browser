@@ -930,10 +930,9 @@ async function handleRawPageCreationDeadline(entry) {
     ownerEpoch: session.browserGeneration ?? null,
     proofOwnerEpoch: proof?.ownerEpoch ?? null,
   });
-  entry.timer = setTimeout(() => {
-    void handleRawPageCreationDeadline(entry).catch(() => {});
-  }, PAGE_CLOSE_TIMEOUT_MS);
-  entry.timer.unref?.();
+  throw Object.assign(new Error('Raw page creation teardown was not verified'), {
+    code: 'raw_page_creation_teardown_unverified',
+  });
 }
 
 const rawPageCreations = new RawCreationRegistry({
@@ -942,6 +941,13 @@ const rawPageCreations = new RawCreationRegistry({
   retryAfterSeconds: 2,
   onRejected: () => tabAdmissionRejectedTotal.inc(),
   onDeadline: handleRawPageCreationDeadline,
+  onDeadlineError: (error, entry) => {
+    log('error', 'raw creation deadline handler failed; retry scheduled', {
+      userId: entry.userKey,
+      kind: entry.kind,
+      error: error.message,
+    });
+  },
 });
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
@@ -1094,15 +1100,22 @@ async function restartBrowser(reason) {
   log('error', 'restarting browser', { reason, totalFailures });
   pluginEvents.emit('browser:restart', { reason });
   try {
-    await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
-    userNavHealth.clear();
-    const launchSlot = browserLaunchSlot;
-    if (launchSlot) invalidateBrowserLaunch(launchSlot, new Error(`Browser restart: ${reason}`));
-    const termination = await closeBrowserFully(`browser_restart:${reason}`);
-    if (!termination?.terminated) throw new Error('Browser process termination could not be verified');
-    retireBrowserLaunchSlot(launchSlot);
-    pluginEvents.emit('browser:closed', { reason });
-    await ensureBrowser();
+    const restartError = Object.assign(new Error(`Browser restart: ${reason}`), {
+      code: 'browser_restarting',
+      statusCode: 503,
+      retryable: true,
+    });
+    await sessionCreationCoordinator.barrier(restartError, async () => {
+      await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
+      userNavHealth.clear();
+      const launchSlot = browserLaunchSlot;
+      if (launchSlot) invalidateBrowserLaunch(launchSlot, restartError);
+      const termination = await closeBrowserFully(`browser_restart:${reason}`);
+      if (!termination?.terminated) throw new Error('Browser process termination could not be verified');
+      retireBrowserLaunchSlot(launchSlot);
+      pluginEvents.emit('browser:closed', { reason });
+      await ensureBrowser();
+    });
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
   } catch (err) {
@@ -1184,10 +1197,9 @@ async function handleRawBrowserOwnerDeadline(entry, targetBrowser, reason) {
     entry.retire?.();
     return;
   }
-  entry.timer = setTimeout(() => {
-    void handleRawBrowserOwnerDeadline(entry, targetBrowser, reason).catch(() => {});
-  }, PAGE_CLOSE_TIMEOUT_MS);
-  entry.timer.unref?.();
+  throw Object.assign(new Error('Raw browser creation teardown was not verified'), {
+    code: 'raw_browser_creation_teardown_unverified',
+  });
 }
 
 async function handleRawContextOwnerDeadline(entry, context, targetBrowser, reason) {
@@ -2268,6 +2280,13 @@ async function getSession(userId, { trace = false, signal } = {}) {
           session: created,
         });
         assertCurrent();
+        if (browser !== b || !b.isConnected()) {
+          throw Object.assign(new Error('Browser generation was superseded before session publication'), {
+            code: 'browser_generation_superseded',
+            statusCode: 503,
+            retryable: true,
+          });
+        }
         if (created._closing) {
           throw Object.assign(new Error('Session creation was superseded before publication completed'), {
             code: 'session_superseded',
@@ -2368,12 +2387,13 @@ async function createPageWithRecoveryForUser(userId, session, {
     getSession,
     log,
     reservePendingCreation,
-    reserveRawCreation: (activeSession, label) => rawPageCreations.acquire({
+    reserveRawCreation: (activeSession, label, { onRetire } = {}) => rawPageCreations.acquire({
       userKey: key,
       kind: 'page',
       owner: activeSession,
       deadlineMs: NEW_PAGE_TIMEOUT_MS + PAGE_CLOSE_TIMEOUT_MS,
       label,
+      onRetire,
     }),
     cleanupLatePage: page => closeOwnedPage(page, 'late_page_recovery'),
     signal,

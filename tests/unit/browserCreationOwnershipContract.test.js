@@ -53,9 +53,11 @@ describe('browser creation ownership source contract', () => {
   test('session publication and teardown require completed hooks and verified ownership', () => {
     const server = read('server.js');
     const hookIdx = server.indexOf("await pluginEvents.emitAsync('session:created'");
+    const browserCheckIdx = server.indexOf('if (browser !== b || !b.isConnected())', hookIdx);
     const publishIdx = server.indexOf('sessions.set(key, created)', hookIdx);
     expect(hookIdx).toBeGreaterThan(-1);
-    expect(publishIdx).toBeGreaterThan(hookIdx);
+    expect(browserCheckIdx).toBeGreaterThan(hookIdx);
+    expect(publishIdx).toBeGreaterThan(browserCheckIdx);
 
     const closeStart = server.indexOf('async function closeSessionImpl');
     const closeEnd = server.indexOf('async function closeAllSessions', closeStart);
@@ -81,6 +83,40 @@ describe('browser creation ownership source contract', () => {
 
     expect(creationBarrier).toBeGreaterThan(-1);
     expect(sessionSnapshot).toBeGreaterThan(creationBarrier);
+  });
+
+  test('browser restart barriers session creation before snapshot and relaunch', () => {
+    const server = read('server.js');
+    const restartStart = server.indexOf('async function restartBrowser');
+    const restartEnd = server.indexOf('function getTotalTabCount', restartStart);
+    const restartSection = server.slice(restartStart, restartEnd);
+    const creationBarrier = restartSection.indexOf('await sessionCreationCoordinator.barrier(');
+    const sessionSnapshot = restartSection.indexOf('await closeAllSessions(');
+    const browserClose = restartSection.indexOf('await closeBrowserFully(');
+    const browserRelaunch = restartSection.indexOf('await ensureBrowser()');
+
+    expect(creationBarrier).toBeGreaterThan(-1);
+    expect(sessionSnapshot).toBeGreaterThan(creationBarrier);
+    expect(browserClose).toBeGreaterThan(sessionSnapshot);
+    expect(browserRelaunch).toBeGreaterThan(browserClose);
+  });
+
+  test('raw creation retry stays registry-owned and verified retirement releases page leases', () => {
+    const server = read('server.js');
+    const pageDeadlineStart = server.indexOf('async function handleRawPageCreationDeadline');
+    const pageDeadlineEnd = server.indexOf('const rawPageCreations', pageDeadlineStart);
+    const pageDeadlineSection = server.slice(pageDeadlineStart, pageDeadlineEnd);
+    const browserDeadlineStart = server.indexOf('async function handleRawBrowserOwnerDeadline');
+    const browserDeadlineEnd = server.indexOf('async function handleRawContextOwnerDeadline', browserDeadlineStart);
+    const browserDeadlineSection = server.slice(browserDeadlineStart, browserDeadlineEnd);
+
+    expect(pageDeadlineSection).toContain("code: 'raw_page_creation_teardown_unverified'");
+    expect(browserDeadlineSection).toContain("code: 'raw_browser_creation_teardown_unverified'");
+    expect(pageDeadlineSection).not.toContain('setTimeout(');
+    expect(browserDeadlineSection).not.toContain('setTimeout(');
+    expect(server).toContain('reserveRawCreation: (activeSession, label, { onRetire } = {})');
+    expect(server).toContain('onRetire,');
+    expect(read('lib/new-page-recovery.js')).toContain('onRetire: () => releasePageLease(activeSession, lease)');
   });
 
   test('popup adoption is bound to its originating context and generation', () => {
