@@ -492,11 +492,36 @@
             }
           },
           "429": {
-            "description": "Tab limit reached.",
+            "description": "Admission timed out before start (`tab_admission_wait_timeout`) or while creating the tab (`tab_admission_operation_timeout`).",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "tab_admission_wait_timeout",
+                            "tab_admission_operation_timeout",
+                            "tab_admission_abandoned_saturated"
+                          ]
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }

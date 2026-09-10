@@ -17,8 +17,14 @@
 
 import { jest } from '@jest/globals';
 import { createPluginEvents } from '../../lib/plugins.js';
+import fs from 'node:fs';
 
 describe('session:destroying event ordering', () => {
+  test('server binds destroying and destroyed events to the exact session context', () => {
+    const source = fs.readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
+    expect(source).toMatch(/emitAsync\('session:destroying',[\s\S]*?context:\s*session\.context/);
+    expect(source).toMatch(/emitAsync\('session:destroyed',[\s\S]*?context:\s*session\.context/);
+  });
   /**
    * Simulate closeSession() from server.js with the PR #75 change:
    *   1. pluginEvents.emitAsync('session:destroying', ...)

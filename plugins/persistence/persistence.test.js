@@ -114,4 +114,46 @@ describe('profile persistence helpers', () => {
     const leftovers = (await fs.readdir(userDir)).filter((name) => name.includes('.tmp-'));
     expect(leftovers).toEqual([]);
   });
+
+  test('concurrent persists use collision-resistant temporary paths', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1234567890);
+    const targets = [];
+    const makeContext = () => ({
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        targets.push(targetPath);
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    });
+
+    try {
+      await Promise.all([
+        persistStorageState({ profileDir: tmpDir, userId: 'same-user', context: makeContext() }),
+        persistStorageState({ profileDir: tmpDir, userId: 'same-user', context: makeContext() }),
+      ]);
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(new Set(targets).size).toBe(2);
+  });
+
+  test('superseded checkpoint is discarded before publication', async () => {
+    const staleState = { cookies: [{ name: 'stale', value: '1' }], origins: [] };
+    const context = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify(staleState));
+      }),
+    };
+
+    const result = await persistStorageState({
+      profileDir: tmpDir,
+      userId: 'replacement-user',
+      context,
+      shouldPublish: () => false,
+    });
+
+    expect(result).toMatchObject({ persisted: false, reason: 'superseded' });
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'replacement-user');
+    await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
 });

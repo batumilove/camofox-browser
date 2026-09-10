@@ -137,6 +137,15 @@ describe('OpenAPI spec', () => {
     expect(createTab.requestBody.content['application/json']).toBeDefined();
   });
 
+  test('POST /tabs documents both admission timeout 429 causes', () => {
+    const response = spec.paths['/tabs']?.post?.responses?.['429'];
+    expect(response).toBeDefined();
+    const serialized = JSON.stringify(response);
+    expect(serialized).toContain('tab_admission_wait_timeout');
+    expect(serialized).toContain('tab_admission_operation_timeout');
+    expect(serialized).toContain('Retry-After');
+  });
+
   test('legacy routes are marked deprecated', () => {
     const legacyPaths = {
       '/act': 'post',

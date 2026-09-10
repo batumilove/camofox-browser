@@ -50,7 +50,9 @@ import { initSentry, captureException as sentryCaptureException, setupExpressErr
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
 import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
 import { killProcessIds } from './lib/browser-processes.js';
-import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from './lib/process-ownership.js';
+import { snapshotOwnedBrowserProcesses, signalOwnedProcess, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from './lib/process-ownership.js';
+import { TabAdmissionController, TabAdmissionError } from './lib/tab-admission.js';
+import { createSessionCloseCoordinator } from './lib/session-close.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
   isDeadContextError, isPageCrashedError, isTimeoutError,
@@ -126,6 +128,25 @@ function log(level, msg, fields = {}) {
     process.stdout.write(line + '\n');
   }
 }
+
+const sessionCloseCoordinator = createSessionCloseCoordinator({
+  destroyingTimeoutMs: CONFIG.sessionDestroyingTimeoutMs,
+});
+const tabAdmission = new TabAdmissionController({
+  maxActive: CONFIG.tabAdmissionMaxActive,
+  maxActivePerUser: CONFIG.tabAdmissionMaxActivePerUser,
+  maxAbandoned: CONFIG.tabAdmissionMaxAbandoned,
+  waitTimeoutMs: CONFIG.tabAdmissionWaitTimeoutMs,
+  operationTimeoutMs: CONFIG.tabAdmissionOperationTimeoutMs,
+  retryAfter: CONFIG.tabAdmissionRetryAfter,
+  onAbandonedSaturated: snapshot => {
+    log('error', 'tab admission abandoned operations saturated', snapshot);
+    browserRestartsTotal.labels('tab_admission_saturated').inc();
+    restartBrowser('tab_admission_saturated').catch(error => {
+      log('error', 'tab admission recovery restart failed', { error: error.message });
+    });
+  },
+});
 
 const app = express();
 const globalJsonParser = express.json({ limit: '100kb' });
@@ -850,6 +871,8 @@ function getTotalTabCount() {
 const DEFAULT_VIRTUAL_DISPLAY_RESOLUTION = '1280x720x24';
 
 class DefaultVirtualDisplay extends VirtualDisplay {
+  ownedProcessIdentity = null;
+
   get xvfb_args() {
     const args = super.xvfb_args;
     const idx = args.indexOf('0');
@@ -861,15 +884,27 @@ class DefaultVirtualDisplay extends VirtualDisplay {
     return args;
   }
 
+  get() {
+    const display = super.get();
+    this.ownedProcessIdentity = snapshotOwnedBrowserProcesses(process.pid)
+      .find(proc => proc.pid === this.proc?.pid) || null;
+    return display;
+  }
+
   kill() {
     const proc = this.proc;
-    if (!proc || this.xvfbDisplayFilesCleanupRegistered) return super.kill();
+    if (!proc || this.xvfbDisplayFilesCleanupRegistered) return false;
 
     this.xvfbDisplayFilesCleanupRegistered = true;
     const cleanup = () => removeXvfbDisplayFiles(this.display);
     if (proc.exitCode === null) proc.once('exit', cleanup);
     else cleanup();
-    return super.kill();
+
+    const identity = this.ownedProcessIdentity;
+    this.proc = null;
+    this.ownedProcessIdentity = null;
+    if (!identity) return false;
+    return signalOwnedProcess(identity, 'SIGTERM');
   }
 }
 
@@ -982,7 +1017,8 @@ async function _closeBrowserFullyImpl(reason) {
 
   // Force-kill only survivors captured before this close began.
   if (pid) {
-    await _forceKillProcessTree(pid, reason);
+    const browserIdentity = ownedBrowserProcesses.find(proc => proc.pid === pid);
+    await _forceKillProcessTree(browserIdentity, reason);
   }
   await _forceKillBrowserProcesses(reason, ownedBrowserProcesses);
 
@@ -1016,53 +1052,33 @@ async function _closeBrowserFullyImpl(reason) {
   });
 }
 
-/**
- * Force-kill a browser process tree by PID. On Linux, kills the process group
- * (SIGKILL -pid). Orphan cleanup is deliberately left to the ownership
- * snapshot captured before browser.close(), below.
- */
-async function _forceKillProcessTree(pid, reason) {
-  if (!pid || pid <= 1) return;
-
-  // Kill the specific browser process first (positive PID = single process)
-  try {
-    process.kill(pid, 'SIGKILL');
-    log('info', 'sent SIGKILL to browser process', { pid, reason });
-  } catch (err) {
-    if (err.code !== 'ESRCH') {
-      log('warn', 'failed to kill browser process', { pid, error: err.message });
-    }
+/** Force-kill only the exact captured browser process generation. */
+async function _forceKillProcessTree(identity, reason) {
+  if (!identity?.pid || identity.pid <= 1) return;
+  const signaled = signalOwnedProcess(identity, 'SIGKILL');
+  if (signaled) {
+    log('info', 'sent generation-safe SIGKILL to browser process', { pid: identity.pid, reason });
   }
-
-  // Then try the process group (Playwright launches with detached:true on Linux,
-  // making the browser a process group leader)
-  try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    // ESRCH = group doesn't exist (browser wasn't a group leader), which is fine
-  }
-
-  // Give the group kill time to complete. Any descendants that escaped it are
-  // selected later only from the pre-close, starttime-safe ownership snapshot.
-  await new Promise(r => setTimeout(r, 200));
-
-  // Give the OS a moment to reclaim resources
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise(r => setTimeout(r, 500));
 }
 
 async function _forceKillBrowserProcesses(reason, ownedBrowserProcesses = []) {
   if (process.platform !== 'linux') return;
   let victims = [];
   try {
-    victims = survivingOwnedBrowserProcesses(ownedBrowserProcesses).map(proc => proc.pid);
+    victims = survivingOwnedBrowserProcesses(ownedBrowserProcesses);
   } catch (err) {
     log('warn', 'failed to scan for browser survivor processes', { reason, error: err.message });
     return;
   }
 
   if (victims.length > 0) {
-    log('warn', 'killing browser survivor processes', { reason, victims });
-    await killProcessIds(victims, { signal: 'SIGKILL', delayMs: 300 });
+    log('warn', 'killing browser survivor processes', {
+      reason,
+      victims: victims.map(proc => proc.pid),
+    });
+    for (const identity of victims) signalOwnedProcess(identity, 'SIGKILL');
+    await new Promise(r => setTimeout(r, 300));
   }
 }
 
@@ -1296,19 +1312,36 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
-  if (session.tracePath) {
-    try {
-      await session.context.tracing.stop({ path: session.tracePath });
-      log('info', 'tracing saved', { userId: key, path: session.tracePath });
-    } catch (err) {
-      log('warn', 'tracing.stop failed', { userId: key, error: err.message });
-    }
-  }
-
-  await session.context.close().catch(() => {});
-  sessions.delete(key);
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  session._closing = true;
+  await sessionCloseCoordinator.close(session, {
+    emitDestroying: () => pluginEvents.emitAsync('session:destroying', {
+      userId: key,
+      reason,
+      session,
+      context: session.context,
+    }),
+    closeContext: async () => {
+      if (session.tracePath) {
+        try {
+          await session.context.tracing.stop({ path: session.tracePath });
+          log('info', 'tracing saved', { userId: key, path: session.tracePath });
+        } catch (err) {
+          log('warn', 'tracing.stop failed', { userId: key, error: err.message });
+        }
+      }
+      await session.context.close().catch(() => {});
+    },
+    emitDestroyed: () => pluginEvents.emitAsync('session:destroyed', {
+      userId: key,
+      reason,
+      session,
+      context: session.context,
+    }),
+    onDestroyingError: err => log('warn', 'session:destroying listener failed', {
+      userId: key, error: err.message,
+    }),
+  });
+  if (sessions.get(key) === session) sessions.delete(key);
 
   refreshActiveTabsGauge();
 }
@@ -2867,11 +2900,22 @@ app.post('/pressure/cleanup', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       429:
- *         description: Tab limit reached.
+ *         description: Admission timed out before start (`tab_admission_wait_timeout`) or while creating the tab (`tab_admission_operation_timeout`).
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying.
+ *             schema:
+ *               type: integer
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/Error'
+ *               allOf:
+ *                 - $ref: '#/components/schemas/Error'
+ *                 - type: object
+ *                   properties:
+ *                     code:
+ *                       type: string
+ *                       enum: [tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated]
  *       409:
  *         description: Cannot enable tracing on an existing session.
  *         content:
@@ -2904,7 +2948,7 @@ app.post('/tabs', async (req, res) => {
       }
     }
 
-    const result = await withTimeout((async () => {
+    const result = await tabAdmission.run(userId, async () => {
       const existing = sessions.get(normalizeUserId(userId));
       if (trace && existing && !existing.tracePath) {
         throw Object.assign(
@@ -2989,11 +3033,19 @@ app.post('/tabs', async (req, res) => {
         httpStatus: tabState.lastNavigationHttpStatus,
         navigationOk: tabState.lastNavigationHttpStatus === null || tabState.lastNavigationHttpStatus < 400,
       };
-    })(), requestTimeoutMs(), 'tab create');
+    });
 
     res.json(result);
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
+    if (err instanceof TabAdmissionError) {
+      res.set('Retry-After', String(err.retryAfter));
+      return res.status(err.statusCode).json({
+        error: err.message,
+        code: err.code,
+        retryAfter: err.retryAfter,
+      });
+    }
     // SSL certificate errors on initial navigation — non-retriable
     const isSslError = err.message && (
       err.message.includes('SEC_ERROR') ||

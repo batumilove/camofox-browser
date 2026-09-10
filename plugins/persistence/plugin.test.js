@@ -109,6 +109,30 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('late destroy for an old context cannot checkpoint or remove its replacement', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const contextA = { storageState: jest.fn() };
+    const contextB = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'replacement-user', context: contextA });
+    await events.emitAsync('session:created', { userId: 'replacement-user', context: contextB });
+    await events.emitAsync('session:destroying', {
+      userId: 'replacement-user',
+      context: contextA,
+      reason: 'replaced',
+    });
+    expect(contextB.storageState).not.toHaveBeenCalled();
+
+    await events.emitAsync('session:cookies:import', { userId: 'replacement-user' });
+
+    expect(contextA.storageState).not.toHaveBeenCalled();
+    expect(contextB.storageState).toHaveBeenCalledTimes(1);
+  });
+
   test('DELETE storage_state destroys the live session without checkpointing and removes persisted state', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
 

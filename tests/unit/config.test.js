@@ -101,6 +101,38 @@ describe('loadConfig', () => {
     expect(config.serverEnv.NAVIGATE_TIMEOUT_MS).toBe('60000');
   });
 
+  test('reads and forwards tab-admission bounds', () => {
+    process.env.TAB_ADMISSION_MAX_ACTIVE = '6';
+    process.env.TAB_ADMISSION_MAX_ACTIVE_PER_USER = '3';
+    process.env.TAB_ADMISSION_MAX_ABANDONED = '2';
+    process.env.TAB_ADMISSION_WAIT_TIMEOUT_MS = '1200';
+    process.env.TAB_ADMISSION_OPERATION_TIMEOUT_MS = '15000';
+    process.env.TAB_ADMISSION_RETRY_AFTER = '4';
+    process.env.SESSION_DESTROYING_TIMEOUT_MS = '2500';
+
+    const config = loadConfig();
+    expect(config).toMatchObject({
+      tabAdmissionMaxActive: 6,
+      tabAdmissionMaxActivePerUser: 3,
+      tabAdmissionMaxAbandoned: 2,
+      tabAdmissionWaitTimeoutMs: 1200,
+      tabAdmissionOperationTimeoutMs: 15000,
+      tabAdmissionRetryAfter: 4,
+      sessionDestroyingTimeoutMs: 2500,
+    });
+    for (const name of [
+      'TAB_ADMISSION_MAX_ACTIVE',
+      'TAB_ADMISSION_MAX_ACTIVE_PER_USER',
+      'TAB_ADMISSION_MAX_ABANDONED',
+      'TAB_ADMISSION_WAIT_TIMEOUT_MS',
+      'TAB_ADMISSION_OPERATION_TIMEOUT_MS',
+      'TAB_ADMISSION_RETRY_AFTER',
+      'SESSION_DESTROYING_TIMEOUT_MS',
+    ]) {
+      expect(config.serverEnv[name]).toBe(process.env[name]);
+    }
+  });
+
   test('reads newPageTimeoutMs from camofox.config.json with a 10s fallback', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-config-'));
     const configPath = path.join(dir, 'camofox.config.json');

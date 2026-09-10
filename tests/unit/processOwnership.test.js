@@ -1,7 +1,12 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from '../../lib/process-ownership.js';
+import {
+  signalOwnedProcess,
+  snapshotOwnedBrowserProcesses,
+  survivingOwnedBrowserProcesses,
+  profilePathsFromProcessSnapshot,
+} from '../../lib/process-ownership.js';
 
 function proc(root, pid, ppid, cmdline, startTime = '10', comm = 'test') {
   const dir = path.join(root, String(pid));
@@ -71,4 +76,34 @@ test('process start time parsing tolerates spaces and parentheses in comm', () =
   const snapshot = snapshotOwnedBrowserProcesses(100, root);
   expect(snapshot.map(p => [p.pid, p.startTime])).toEqual([[101, '42']]);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('generation-safe signaling refuses a reused numeric PID', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-proc-'));
+  proc(root, 100, 1, 'node\0server.js');
+  proc(root, 101, 100, '/usr/bin/Xvfb\0:10', '10');
+  const [identity] = snapshotOwnedBrowserProcesses(100, root);
+  const signaled = [];
+
+  expect(signalOwnedProcess(identity, 'SIGTERM', {
+    procRoot: root,
+    signal: (pid, name) => signaled.push([pid, name]),
+  })).toBe(true);
+  expect(signaled).toEqual([[101, 'SIGTERM']]);
+
+  fs.writeFileSync(path.join(root, '101', 'stat'), '101 (test) S 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99');
+  expect(signalOwnedProcess(identity, 'SIGKILL', {
+    procRoot: root,
+    signal: (pid, name) => signaled.push([pid, name]),
+  })).toBe(false);
+  expect(signaled).toEqual([[101, 'SIGTERM']]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('server uses generation-safe signaling for browser and virtual-display cleanup', () => {
+  const source = fs.readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
+  const displayClass = source.match(/class DefaultVirtualDisplay[\s\S]*?\n}\n\nlet virtualDisplay/)?.[0] ?? '';
+  const survivorCleanup = source.match(/async function _forceKillBrowserProcesses[\s\S]*?\n}\n/)?.[0] ?? '';
+  expect(displayClass).toContain('signalOwnedProcess(');
+  expect(survivorCleanup).toContain('signalOwnedProcess(');
 });
