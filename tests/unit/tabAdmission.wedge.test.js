@@ -44,7 +44,9 @@ describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
       await Promise.all(rejections);
 
       // Capacity must be released even though the four timed-out operations
-      // never settle, otherwise every profile remains blocked indefinitely.
+      // never settle. The 2026-09-09/10 incident produced this exact shape:
+      // all four active slots stayed occupied and unrelated profiles received
+      // tab_admission_wait_timeout until targeted stale-tab cleanup.
       const fifth = controller.run('recovery-user', async () => 'recovered');
       await flush();
       expect(controller.snapshot()).toMatchObject({ active: 1, pending: 0 });
