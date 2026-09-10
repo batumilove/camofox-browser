@@ -8,9 +8,37 @@
  * 4. Session expiry sets _closing before teardown
  */
 
-import { detachSessionForClose } from '../../lib/tab-admission.js';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { coalesceSessionClose, detachSessionForClose } from '../../lib/tab-admission.js';
 
 describe('session close registry detachment', () => {
+  test('coalesces concurrent teardown calls for the same session', async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const session = {};
+    let calls = 0;
+    const first = coalesceSessionClose(session, async () => { calls += 1; await gate; });
+    const second = coalesceSessionClose(session, async () => { calls += 1; });
+
+    expect(second).toBe(first);
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    release();
+    await Promise.all([first, second]);
+  });
+
+  test('production closeSession delegates the entire teardown to the once guard', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const closeStart = source.indexOf('async function closeSession(');
+    const closeEnd = source.indexOf('\nasync function closeAllSessions(', closeStart);
+    const closeSource = source.slice(closeStart, closeEnd);
+
+    expect(closeSource).toContain('return coalesceSessionClose(session, async () => {');
+  });
+
   test('detaches the exact session before asynchronous context cleanup settles', () => {
     const session = { _closing: false };
     const sessions = new Map([['internal-user', session]]);

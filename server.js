@@ -44,6 +44,7 @@ import {
   TabCapacityReservations,
   canReapEmptySession,
   closePageWithin,
+  coalesceSessionClose,
   detachSessionForClose,
   releaseOnAbort,
   replaceSessionAfterProxyFailure,
@@ -1244,6 +1245,8 @@ async function closeSession(userId, session, {
 } = {}) {
   if (!session) return;
 
+  return coalesceSessionClose(session, async () => {
+
   const key = normalizeUserId(userId);
   // Detach synchronously so a hung context.close() cannot leave an internal
   // _closing session resident. Identity checking protects a newer session
@@ -1299,6 +1302,7 @@ async function closeSession(userId, session, {
   });
 
   refreshActiveTabsGauge();
+  });
 }
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
