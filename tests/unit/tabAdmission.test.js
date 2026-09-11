@@ -1,7 +1,11 @@
 import { jest } from '@jest/globals';
 import {
+  InFlightOperations,
+  runWithRetainedLock,
+  SessionCapacityReservations,
   TabAdmissionController,
   TabCapacityReservations,
+  claimTabForPressureCleanup,
   awaitAbortableResource,
   canReapEmptySession,
   closePageWithin,
@@ -443,6 +447,33 @@ describe('bounded timeout cleanup helpers', () => {
     }
   });
 
+  test('exposes raw teardown operations to a shutdown drain after bounded observation returns', async () => {
+    jest.useFakeTimers();
+    try {
+      const rawOperations = new InFlightOperations();
+      const closeGate = deferred();
+      const teardown = runBoundedSessionTeardown({
+        closeContext: () => closeGate.promise,
+        emitDestroyed: async () => {},
+        timeoutMs: 25,
+        trackOperation: (operation) => rawOperations.track(operation),
+      });
+
+      await jest.advanceTimersByTimeAsync(25);
+      await teardown;
+      expect(rawOperations.size).toBe(1);
+      let drained = false;
+      const drain = rawOperations.drain().then(() => { drained = true; });
+      await flush();
+      expect(drained).toBe(false);
+      closeGate.resolve();
+      await drain;
+      expect(rawOperations.size).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('a hung page close is attempted once and returns at the cleanup deadline', async () => {
     jest.useFakeTimers();
     try {
@@ -522,5 +553,105 @@ describe('bounded timeout cleanup helpers', () => {
     closeGate.resolve();
     await expect(result).rejects.toThrow('timed out during close');
     expect(getSession).not.toHaveBeenCalled();
+  });
+
+  test('shutdown drain remains pending until raw timed operations settle', async () => {
+    const operations = new InFlightOperations();
+    const gate = deferred();
+    operations.track(gate.promise);
+    expect(operations.size).toBe(1);
+
+    let drained = false;
+    const drain = operations.drain().then(() => { drained = true; });
+    await flush();
+    expect(drained).toBe(false);
+    gate.resolve();
+    await drain;
+    expect(operations.size).toBe(0);
+  });
+
+  test('session capacity reservations atomically reject concurrent boundary crossings', () => {
+    let published = 1;
+    const capacity = new SessionCapacityReservations({
+      maxSessions: 2,
+      getPublishedCount: () => published,
+    });
+
+    const releaseFirst = capacity.reserve();
+    expect(() => capacity.reserve()).toThrow('Maximum concurrent sessions reached');
+    releaseFirst();
+    const releaseSecond = capacity.reserve();
+    published += 1;
+    releaseSecond();
+    expect(capacity.snapshot()).toEqual({ reserved: 0, detached: 0 });
+  });
+
+  test('detached contexts remain in session capacity until their raw close settles', async () => {
+    const capacity = new SessionCapacityReservations({
+      maxSessions: 1,
+      getPublishedCount: () => 0,
+    });
+    const closeGate = deferred();
+    capacity.trackDetached(closeGate.promise);
+
+    expect(capacity.snapshot()).toEqual({ reserved: 0, detached: 1 });
+    expect(() => capacity.reserve()).toThrow('Maximum concurrent sessions reached');
+    closeGate.resolve();
+    await flush();
+    expect(capacity.snapshot()).toEqual({ reserved: 0, detached: 0 });
+  });
+
+  test('pressure cleanup claim rejects activity after selection and unpublishes before awaiting cleanup', () => {
+    const tabState = { toolCalls: 4 };
+    const group = new Map([['tab-1', tabState]]);
+    const session = { tabGroups: new Map([['group', group]]) };
+    const sessions = new Map([['user-1', session]]);
+    const lock = {
+      active: false,
+      tryAcquire() { if (this.active) return false; this.active = true; return true; },
+      release() { this.active = false; },
+    };
+
+    tabState.toolCalls += 1;
+    expect(claimTabForPressureCleanup({
+      sessions, userId: 'user-1', session, group, tabId: 'tab-1', tabState,
+      observedToolCalls: 4, lock,
+    })).toBeNull();
+    expect(group.get('tab-1')).toBe(tabState);
+
+    const claim = claimTabForPressureCleanup({
+      sessions, userId: 'user-1', session, group, tabId: 'tab-1', tabState,
+      observedToolCalls: 5, lock,
+    });
+    expect(claim).not.toBeNull();
+    expect(group.has('tab-1')).toBe(false);
+    claim.release();
+    expect(lock.active).toBe(false);
+  });
+
+  test('retains a page lock after request timeout until raw page work settles', async () => {
+    const raw = deferred();
+    const lock = {
+      active: true,
+      release: jest.fn(() => { lock.active = false; }),
+      tryAcquire: jest.fn(() => {
+        if (lock.active) return false;
+        lock.active = true;
+        return true;
+      }),
+    };
+    const timeout = Promise.reject(new Error('timed out'));
+    timeout.catch(() => {});
+
+    await expect(runWithRetainedLock(lock, () => raw.promise, () => timeout))
+      .rejects.toThrow('timed out');
+    expect(lock.tryAcquire()).toBe(false);
+    expect(lock.release).not.toHaveBeenCalled();
+
+    raw.resolve();
+    await raw.promise;
+    await flush();
+    expect(lock.release).toHaveBeenCalledTimes(1);
+    expect(lock.tryAcquire()).toBe(true);
   });
 });

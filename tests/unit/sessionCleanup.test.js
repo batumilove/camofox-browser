@@ -18,6 +18,23 @@ import {
 } from '../../lib/tab-admission.js';
 
 describe('session close registry detachment', () => {
+  test('admission abort invalidates only the exact in-flight session creation', () => {
+    const generations = new SessionCreationGenerations();
+    const controller = new AbortController();
+    const token = generations.begin('user-1');
+    let cleanups = 0;
+    generations.setInvalidationHandler(token, () => { cleanups += 1; });
+
+    const unbind = generations.bindAbort(token, controller.signal);
+    controller.abort(new Error('tab admission timed out'));
+
+    expect(generations.canPublish(token)).toBe(false);
+    expect(cleanups).toBe(1);
+    const successor = generations.begin('user-1');
+    unbind();
+    expect(generations.canPublish(successor)).toBe(true);
+  });
+
   test('delete invalidation prevents an in-flight creation from publishing', () => {
     const generations = new SessionCreationGenerations();
     const token = generations.begin('user-1');
@@ -81,6 +98,7 @@ describe('session close registry detachment', () => {
     expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
     expect(getSessionSource).toContain('sessionCreationGenerations.setInvalidationHandler(creationToken');
     expect(getSessionSource).toContain('sessionCreationGenerations.invalidateToken(creationToken)');
+    expect(getSessionSource).toContain('sessionCreationGenerations.bindAbort(creationToken, signal)');
     expect(getSessionSource.indexOf("pluginEvents.emitAsync('session:created'")).toBeLessThan(
       getSessionSource.indexOf('sessions.set(key, created)'),
     );
@@ -89,7 +107,43 @@ describe('session close registry detachment', () => {
     expect(deleteSource).toContain('sessionCreationGenerations.invalidate(userId)');
     expect(deleteSource).toContain('sessionCreations.get(userId)');
     expect(shutdownSource).toContain('sessionCreationGenerations.invalidateAll()');
-    expect(shutdownSource).toContain('Array.from(sessionCreations.values())');
+    expect(shutdownSource).toContain('const httpClosePromise = closeHttpServer()');
+    expect(shutdownSource).toContain('await Promise.allSettled(Array.from(sessionCreations.values()))');
+    expect(shutdownSource).toContain('await activeTimedOperations.drain()');
+    expect(shutdownSource).toContain('await activeSessionTeardownOperations.drain()');
+    expect(shutdownSource).toContain('await httpClosePromise');
+    expect(shutdownSource).toContain('teardownTimeoutMs: Number.POSITIVE_INFINITY');
+    expect(shutdownSource).toContain('const closeSessionsPromise = closeAllSessions(');
+    expect(shutdownSource).toContain('const closeBrowserPromise = closeBrowserFully(');
+    expect(shutdownSource).toContain('await Promise.allSettled([closeSessionsPromise, closeBrowserPromise])');
+    expect(shutdownSource.indexOf('const closeSessionsPromise = closeAllSessions(')).toBeLessThan(
+      shutdownSource.indexOf('const closeBrowserPromise = closeBrowserFully('),
+    );
+    expect(shutdownSource.indexOf('const closeBrowserPromise = closeBrowserFully(')).toBeLessThan(
+      shutdownSource.indexOf('await activeTimedOperations.drain()'),
+    );
+    expect(shutdownSource.indexOf('await httpClosePromise')).toBeLessThan(
+      shutdownSource.indexOf('await activeTimedOperations.drain()'),
+    );
+    expect(shutdownSource).toContain("await closeBrowserFully(`shutdown:${signal}:final_sweep`)");
+    expect(getSessionSource).toContain('sessionCapacity.reserve()');
+    expect(getSessionSource).toContain('await closeInvalidatedContext()');
+    expect(getSessionSource).toContain("await closeSession(key, session, { reason: 'closing_session_replacement'");
+
+    const ensureBrowserSource = source.slice(
+      source.indexOf('async function ensureBrowser()'),
+      source.indexOf('// Helper to normalize userId', source.indexOf('async function ensureBrowser()')),
+    );
+    expect(ensureBrowserSource).toContain("code: 'shutting_down'");
+    expect(ensureBrowserSource.indexOf("code: 'shutting_down'")).toBeLessThan(
+      ensureBrowserSource.indexOf('browserLaunchCoordinator.ensure()'),
+    );
+
+    const createHandlerSource = source.slice(
+      source.indexOf('async function createTabHandler('),
+      source.indexOf("app.post('/tabs', createTabHandler)"),
+    );
+    expect(createHandlerSource).toContain('getSession(userId, { trace: !!trace, signal })');
   });
 
   test('coalesces concurrent teardown calls for the same session', async () => {
@@ -115,6 +169,21 @@ describe('session close registry detachment', () => {
     const closeSource = source.slice(closeStart, closeEnd);
 
     expect(closeSource).toContain('return coalesceSessionClose(session, async () => {');
+    expect(closeSource).toContain('sessionCapacity.trackDetached(detachedClose)');
+    expect(closeSource).toContain('contextClosePromise.then(settleDetachedCapacity, settleDetachedCapacity)');
+    expect(closeSource).not.toContain('if (detached) {');
+    expect(closeSource).toContain('trackOperation: (operation) => activeSessionTeardownOperations.track(operation)');
+  });
+
+  test('destroySession delegates detachment to closeSession so capacity remains accounted', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const start = source.indexOf('function destroySession(');
+    const end = source.indexOf('\nfunction findTab(', start);
+    const destroySource = source.slice(start, end);
+
+    expect(destroySource).toContain('closeSession(key, session');
+    expect(destroySource).not.toContain('sessions.delete(key)');
   });
 
   test('detaches the exact session before asynchronous context cleanup settles', () => {
@@ -370,6 +439,28 @@ describe('getSession _closing flag handling', () => {
 });
 
 describe('YT transcript session cleanup', () => {
+  test('production plugin delegates transcript teardown to closeSession accounting', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../plugins/youtube/index.js'), 'utf8');
+    const cleanupStart = source.indexOf('const releaseTranscriptLease = reservePendingTabCreation(session)');
+    const cleanupSource = source.slice(
+      cleanupStart,
+      source.indexOf('\n        }\n      }\n    });', cleanupStart),
+    );
+
+    expect(source).toContain('closeSession } = ctx');
+    expect(source).toContain("import { reservePendingTabCreation } from '../../lib/tab-admission.js'");
+    expect(source.indexOf('const releaseTranscriptLease = reservePendingTabCreation(session)')).toBeLessThan(
+      source.indexOf('page = await session.context.newPage()'),
+    );
+    expect(cleanupSource).toContain('releaseTranscriptLease()');
+    expect(cleanupSource).toContain('safePageClose(page, { retainUntilSettled: true })');
+    expect(cleanupSource).toContain('(session._pendingTabCreations || 0) === 0');
+    expect(cleanupSource).toContain('await closeSession(ytKey, session');
+    expect(cleanupSource).not.toContain('sessions.delete(');
+    expect(cleanupSource).not.toContain('context.close(');
+  });
+
   // Simulate the finally-block cleanup logic from browserTranscript
   function ytCleanup(sessions, ytKey, contextPagesResult, contextPagesThrows) {
     const ytSession = sessions.get(ytKey);

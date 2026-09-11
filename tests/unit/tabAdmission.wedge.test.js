@@ -24,6 +24,39 @@ async function flush() {
 }
 
 describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
+  test('popup registration is bound to its exact originating session and capacity', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const popupSource = source.slice(
+      source.indexOf('function attachPopupHandler('),
+      source.indexOf('\nfunction pressureHash('),
+    );
+
+    expect(popupSource).toContain('ownerSession');
+    expect(popupSource).toContain('sessions.get(key) !== ownerSession');
+    expect(popupSource).toContain('tabCapacity.reserve(key)');
+    expect(popupSource).toContain('safePageClose(popupPage');
+    expect(popupSource).not.toContain('const currentSession = sessions.get(key)');
+  });
+
+  test('pressure cleanup holds the tab lock through asynchronous cleanup and revalidates identity', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const pressureSource = source.slice(
+      source.indexOf('async function camofoxPressureCleanup('),
+      source.indexOf('\nasync function isGoogleUnavailable('),
+    );
+    const claimAt = pressureSource.indexOf('claimTabForPressureCleanup({');
+    const downloadsAt = pressureSource.indexOf('await clearTabDownloads(item.tabState)');
+    const closeAt = pressureSource.indexOf('await safePageClose(item.tabState.page, { retainUntilSettled: true })');
+
+    expect(claimAt).toBeGreaterThan(-1);
+    expect(pressureSource).toContain('observedToolCalls: item.toolCalls');
+    expect(pressureSource).toContain('safePageClose(item.tabState.page, { retainUntilSettled: true })');
+    expect(claimAt).toBeLessThan(downloadsAt);
+    expect(downloadsAt).toBeLessThan(closeAt);
+  });
+
   test('pressure cleanup preserves empty sessions with pending tab creations', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
