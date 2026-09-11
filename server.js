@@ -1437,13 +1437,23 @@ async function getSession(userId, { trace = false } = {}) {
         tracePath,
         _pendingTabCreations: 0,
       };
+      try {
+        await pluginEvents.emitAsync('session:created', {
+          userId: key,
+          context,
+          isCurrent: () => sessionCreationGenerations.canPublish(creationToken),
+        });
+        await requirePublishable();
+      } catch (error) {
+        await pluginEvents.emitAsyncSettled('session:destroyed', {
+          userId: key,
+          context,
+          reason: 'session_creation_failed',
+        });
+        await settleWithin(context.close(), 2000);
+        throw error;
+      }
       sessions.set(key, created);
-      await pluginEvents.emitAsync('session:created', {
-        userId: key,
-        context,
-        isCurrent: () => sessionCreationGenerations.canPublish(creationToken),
-      });
-      await requirePublishable();
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
@@ -2801,7 +2811,7 @@ app.post('/pressure/cleanup', authMiddleware(), async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-app.post('/tabs', async (req, res) => {
+async function createTabHandler(req, res) {
   try {
     const { userId, sessionKey, listItemId, url, trace } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
@@ -2870,7 +2880,11 @@ app.post('/tabs', async (req, res) => {
               }
               pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
               log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-              return { tabId, url: page.url() };
+              const createdTab = { tabId, url: page.url() };
+              if (req.camofoxLegacyOpen) {
+                createdTab.title = await page.title().catch(() => '');
+              }
+              return createdTab;
             },
             });
           } finally {
@@ -2904,6 +2918,9 @@ app.post('/tabs', async (req, res) => {
       }
     });
 
+    if (req.camofoxLegacyOpen) {
+      return res.json({ ok: true, targetId: result.tabId, ...result });
+    }
     res.json(result);
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
@@ -2929,7 +2946,9 @@ app.post('/tabs', async (req, res) => {
     }
     handleRouteError(err, req, res);
   }
-});
+}
+
+app.post('/tabs', createTabHandler);
 
 // Navigate
 /**
@@ -5639,81 +5658,18 @@ app.get('/tabs', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-app.post('/tabs/open', async (req, res) => {
-  try {
-    const { url, userId, listItemId = 'default' } = req.body;
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
-    }
-    if (!url) {
-      return res.status(400).json({ error: 'url is required' });
-    }
-    
-    const urlErr = validateUrl(url);
-    if (urlErr) return res.status(400).json({ error: urlErr });
-    
-    let session = await getSession(userId);
-    
-    // Recycle oldest tab when limits are reached instead of rejecting
-    let totalTabs = 0;
-    for (const g of session.tabGroups.values()) totalTabs += g.size;
-    if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId, userId);
-      if (!recycled) {
-        return res.status(429).json({ error: 'Maximum tabs per session reached' });
-      }
-    }
-    
-    let group = getTabGroup(session, listItemId);
-    
-    let page = await session.context.newPage();
-    const tabId = fly.makeTabId();
-    let tabState = createTabState(page);
-    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-    group.set(tabId, tabState);
-    attachPopupHandler(page, userId, listItemId);
-    refreshActiveTabsGauge();
-    
-    try {
-      await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-    } catch (navErr) {
-      if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
-        log('warn', 'tab open failed, retrying with fresh proxy', {
-          reqId: req.reqId, tabId, error: navErr.message,
-        });
-        browserRestartsTotal.labels('proxy_retry').inc();
-        const key = normalizeUserId(userId);
-        const oldSession = sessions.get(key);
-        if (oldSession) {
-          await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-        }
-        session = await getSession(userId);
-        group = getTabGroup(session, listItemId);
-        page = await session.context.newPage();
-        tabState = createTabState(page);
-        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-        group.set(tabId, tabState);
-        attachPopupHandler(page, userId, listItemId);
-        refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-      } else {
-        throw navErr;
-      }
-    }
-    tabState.visitedUrls.add(url);
-    
-    log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
-    res.json({ 
-      ok: true,
-      targetId: tabId,
-      tabId,
-      url: page.url(),
-      title: await page.title().catch(() => '')
-    });
-  } catch (err) {
-    log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
-    handleRouteError(err, req, res);
+app.post('/tabs/open', (req, res) => {
+  const { url, userId, listItemId = 'default' } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
   }
+  if (!url) {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  req.camofoxLegacyOpen = true;
+  req.body = { ...req.body, sessionKey: req.body.sessionKey || listItemId };
+  return createTabHandler(req, res);
 });
 
 // POST /start - Start browser (OpenClaw expects this)

@@ -1,4 +1,7 @@
 import { jest } from '@jest/globals';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import {
   TabAdmissionController,
   TabCapacityReservations,
@@ -21,6 +24,18 @@ async function flush() {
 }
 
 describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
+  test('legacy /tabs/open delegates to the admission-protected create handler', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const legacyStart = source.indexOf("app.post('/tabs/open'");
+    const legacyEnd = source.indexOf('\n// POST /start', legacyStart);
+    const legacySource = source.slice(legacyStart, legacyEnd);
+
+    expect(source).toContain("app.post('/tabs', createTabHandler)");
+    expect(legacySource).toContain('return createTabHandler(req, res)');
+    expect(legacySource).not.toContain('context.newPage()');
+  });
+
   test('keeps bounded-cleanup work abandoned until its underlying close settles', async () => {
     jest.useFakeTimers();
     try {

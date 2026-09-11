@@ -66,10 +66,11 @@ describe('session close registry detachment', () => {
 
     expect(getSessionSource).toContain('sessionCreationGenerations.begin(key)');
     expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
-    expect(getSessionSource.indexOf('sessions.set(key, created)')).toBeLessThan(
-      getSessionSource.indexOf("pluginEvents.emitAsync('session:created'"),
+    expect(getSessionSource.indexOf("pluginEvents.emitAsync('session:created'")).toBeLessThan(
+      getSessionSource.indexOf('sessions.set(key, created)'),
     );
     expect(getSessionSource).toContain('isCurrent: () => sessionCreationGenerations.canPublish(creationToken)');
+    expect(getSessionSource).toContain("reason: 'session_creation_failed'");
     expect(deleteSource).toContain('sessionCreationGenerations.invalidate(userId)');
     expect(deleteSource).toContain('sessionCreations.get(userId)');
     expect(shutdownSource).toContain('sessionCreationGenerations.invalidateAll()');

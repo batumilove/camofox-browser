@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { jest } from '@jest/globals';
 import {
+  CheckpointSequenceRegistry,
   getUserPersistencePaths,
   loadPersistedStorageState,
   persistStorageState,
@@ -32,6 +33,16 @@ describe('profile persistence helpers', () => {
     expect(first.metaPath.startsWith(first.userDir)).toBe(true);
     expect(path.basename(first.userDir)).not.toContain('/');
     expect(path.basename(first.userDir)).not.toContain(':');
+  });
+
+  test('checkpoint generations are forgotten after inactive users settle', () => {
+    const registry = new CheckpointSequenceRegistry();
+    for (let index = 0; index < 100; index += 1) {
+      const userId = `ephemeral-${index}`;
+      const sequence = registry.advance(userId);
+      expect(registry.forgetIfCurrent(userId, sequence, false)).toBe(true);
+    }
+    expect(registry.size).toBe(0);
   });
 
   test('loadPersistedStorageState returns undefined when no state exists', async () => {

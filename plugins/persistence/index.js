@@ -24,6 +24,7 @@
  */
 
 import {
+  CheckpointSequenceRegistry,
   getUserPersistencePaths,
   loadPersistedStorageState,
   persistStorageState,
@@ -48,13 +49,11 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // Track active sessions for checkpoint on close
   const activeSessions = new Map(); // userId -> context
-  const checkpointSequences = new Map(); // userId -> latest requested checkpoint generation
+  const checkpointSequences = new CheckpointSequenceRegistry();
   const creationValidity = new WeakMap(); // context -> core creation-generation predicate
 
   function advanceCheckpointSequence(userId) {
-    const sequence = (checkpointSequences.get(userId) || 0) + 1;
-    checkpointSequences.set(userId, sequence);
-    return sequence;
+    return checkpointSequences.advance(userId);
   }
 
   /**
@@ -63,21 +62,25 @@ export async function register(app, ctx, pluginConfig = {}) {
   async function checkpoint(userId, context, reason) {
     if (!context) return;
     const sequence = advanceCheckpointSequence(userId);
-    const result = await persistStorageState({
-      profileDir,
-      userId,
-      context,
-      logger,
-      shouldPublish: () => (
-        (creationValidity.get(context)?.() ?? true)
-        && activeSessions.get(userId) === context
-        && checkpointSequences.get(userId) === sequence
-      ),
-    });
-    if (result.persisted) {
-      log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+    try {
+      const result = await persistStorageState({
+        profileDir,
+        userId,
+        context,
+        logger,
+        shouldPublish: () => (
+          (creationValidity.get(context)?.() ?? true)
+          && activeSessions.get(userId) === context
+          && checkpointSequences.current(userId) === sequence
+        ),
+      });
+      if (result.persisted) {
+        log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+      }
+      return result;
+    } finally {
+      checkpointSequences.forgetIfCurrent(userId, sequence, activeSessions.has(userId));
     }
-    return result;
   }
 
   // --- Lifecycle hooks ---
@@ -104,6 +107,11 @@ export async function register(app, ctx, pluginConfig = {}) {
       advanceCheckpointSequence(userId);
       if (activeSessions.get(userId) === context) activeSessions.delete(userId);
       creationValidity.delete(context);
+      checkpointSequences.forgetIfCurrent(
+        userId,
+        checkpointSequences.current(userId),
+        activeSessions.has(userId),
+      );
       return true;
     };
 
@@ -136,6 +144,11 @@ export async function register(app, ctx, pluginConfig = {}) {
     await checkpoint(userId, context, reason).catch(() => {});
     if (activeSessions.get(userId) === context) activeSessions.delete(userId);
     creationValidity.delete(context);
+    checkpointSequences.forgetIfCurrent(
+      userId,
+      checkpointSequences.current(userId),
+      activeSessions.has(userId),
+    );
   });
 
   // On session destroyed (post-close): cleanup tracking if not already done
@@ -145,6 +158,11 @@ export async function register(app, ctx, pluginConfig = {}) {
       activeSessions.delete(userId);
     }
     if (context) creationValidity.delete(context);
+    checkpointSequences.forgetIfCurrent(
+      userId,
+      checkpointSequences.current(userId),
+      activeSessions.has(userId),
+    );
   });
 
   // Shutdown checkpoints are owned by session:destroying while contexts are alive.
