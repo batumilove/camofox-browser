@@ -75,6 +75,32 @@ describe('lib/plugins', () => {
       await events.emitAsync('nonexistent', {});
       // No error thrown
     });
+
+    test('emitAsync starts every listener even when earlier listeners throw', async () => {
+      const events = createPluginEvents();
+      const called = [];
+      events.on('fanout', () => { called.push('sync-failure'); throw new Error('sync failure'); });
+      events.on('fanout', async () => { called.push('async-failure'); throw new Error('async failure'); });
+      events.on('fanout', () => { called.push('survivor'); });
+
+      await expect(events.emitAsync('fanout', {})).rejects.toThrow('sync failure');
+      expect(called).toEqual(['sync-failure', 'async-failure', 'survivor']);
+    });
+
+    test('fire-and-forget emit isolates sync and async listener failures', async () => {
+      const events = createPluginEvents();
+      const called = [];
+      const errors = [];
+      events.onListenerError = (error, eventName) => errors.push(`${eventName}:${error.message}`);
+      events.on('observe', () => { called.push('sync-failure'); throw new Error('sync failure'); });
+      events.on('observe', async () => { called.push('async-failure'); throw new Error('async failure'); });
+      events.on('observe', () => { called.push('survivor'); });
+
+      expect(() => events.emit('observe', {})).not.toThrow();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(called).toEqual(['sync-failure', 'async-failure', 'survivor']);
+      expect(errors).toEqual(['observe:sync failure', 'observe:async failure']);
+    });
   });
 
   describe('loadPlugins', () => {

@@ -4,8 +4,13 @@ import {
   TabCapacityReservations,
   awaitAbortableResource,
   canReapEmptySession,
+  closePageWithin,
+  replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
+  runBoundedSessionTeardown,
   sendTabAdmissionError,
+  settleAllConcurrently,
+  settleWithin,
   withAbortableResource,
 } from '../../lib/tab-admission.js';
 
@@ -22,6 +27,50 @@ async function flush() {
 }
 
 describe('TabAdmissionController', () => {
+  test('snapshot reports pending counts per user without exposing operations', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 4,
+    });
+    const gate = deferred();
+    const active = controller.run('user-a', () => gate.promise);
+    const queuedA = controller.run('user-a', async () => 'a');
+    const queuedB = controller.run('user-b', async () => 'b');
+    await flush();
+
+    expect(controller.snapshot().pendingByUser).toEqual({ 'user-a': 1, 'user-b': 1 });
+
+    gate.resolve('done');
+    await expect(active).resolves.toBe('done');
+    await expect(queuedA).resolves.toBe('a');
+    await expect(queuedB).resolves.toBe('b');
+  });
+
+  test('snapshot counts pending prototype-named user IDs as ordinary keys', async () => {
+    const controller = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxPending: 4,
+    });
+    const gate = deferred();
+    const active = controller.run('active-user', () => gate.promise);
+    const queued = ['__proto__', 'constructor', 'toString'].map((user) => (
+      controller.run(user, async () => user)
+    ));
+    await flush();
+
+    const snapshot = controller.snapshot();
+    expect(Object.hasOwn(snapshot.pendingByUser, '__proto__')).toBe(true);
+    expect(snapshot.pendingByUser.__proto__).toBe(1);
+    expect(snapshot.pendingByUser.constructor).toBe(1);
+    expect(snapshot.pendingByUser.toString).toBe(1);
+
+    gate.resolve('done');
+    await expect(active).resolves.toBe('done');
+    await expect(Promise.all(queued)).resolves.toEqual(['__proto__', 'constructor', 'toString']);
+  });
+
   test('enforces the global active limit and starts queued work after release', async () => {
     const controller = new TabAdmissionController({ maxActive: 2, maxActivePerUser: 2, maxPending: 4 });
     const gates = [deferred(), deferred(), deferred()];
@@ -114,7 +163,7 @@ describe('TabAdmissionController', () => {
     expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
   });
 
-  test('times out active work, aborts it, and releases only after late settlement', async () => {
+  test('times out active work, aborts it, and releases before late settlement', async () => {
     jest.useFakeTimers();
     try {
       const controller = new TabAdmissionController({
@@ -136,11 +185,11 @@ describe('TabAdmissionController', () => {
       await jest.advanceTimersByTimeAsync(100);
       await firstRejection;
       expect(signal.aborted).toBe(true);
-      expect(controller.snapshot()).toMatchObject({ active: 1, pending: 1 });
+      await expect(second).resolves.toBe('next');
+      expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
 
       late.resolve('ignored');
       await flush();
-      await expect(second).resolves.toBe('next');
       expect(controller.snapshot()).toMatchObject({ active: 0, pending: 0 });
     } finally {
       jest.useRealTimers();
@@ -295,5 +344,183 @@ describe('awaitAbortableResource', () => {
     await expect(result).rejects.toThrow('page closed');
     expect(registered.size).toBe(0);
     expect(close).toHaveBeenCalledWith(resource);
+  });
+
+  test('unregisters a managed resource immediately when aborted work never settles', async () => {
+    const abort = new AbortController();
+    const registered = new Map();
+    const close = jest.fn(async () => {});
+    const resource = { id: 'wedged-tab' };
+
+    const result = withAbortableResource({
+      create: async () => resource,
+      signal: abort.signal,
+      register: async (value) => registered.set(value.id, value),
+      unregister: async (value) => registered.delete(value.id),
+      cleanup: close,
+      operation: async () => new Promise(() => {}),
+    });
+    void result.catch(() => {});
+    await new Promise(setImmediate);
+    expect(registered.has('wedged-tab')).toBe(true);
+
+    abort.abort(new Error('request timed out'));
+    await new Promise(setImmediate);
+
+    expect(registered.size).toBe(0);
+    expect(close).toHaveBeenCalledWith(resource);
+  });
+});
+
+describe('bounded timeout cleanup helpers', () => {
+  test('starts every session teardown concurrently', async () => {
+    const first = deferred();
+    const second = deferred();
+    const started = [];
+    const work = settleAllConcurrently([
+      ['first', first],
+      ['second', second],
+    ], async ([name, gate]) => {
+      started.push(name);
+      await gate.promise;
+      return name;
+    });
+
+    await flush();
+    expect(started).toEqual(['first', 'second']);
+    first.resolve();
+    second.resolve();
+    await expect(work).resolves.toEqual([
+      expect.objectContaining({ status: 'fulfilled', value: 'first' }),
+      expect.objectContaining({ status: 'fulfilled', value: 'second' }),
+    ]);
+  });
+
+  test('continues teardown after hung steps and synchronous close failure', async () => {
+    jest.useFakeTimers();
+    try {
+      const calls = [];
+      const teardown = runBoundedSessionTeardown({
+        steps: [
+          ['session:destroying', () => new Promise(() => {})],
+          ['tracing.stop', async () => { calls.push('tracing.stop'); }],
+        ],
+        closeContext: () => {
+          calls.push('context.close');
+          throw new Error('close exploded');
+        },
+        emitDestroyed: async () => { calls.push('session:destroyed'); },
+        timeoutMs: 25,
+      });
+
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(teardown).resolves.toBeUndefined();
+      expect(calls).toEqual(['tracing.stop', 'context.close', 'session:destroyed']);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('returns after hung context close and hung destroyed listener', async () => {
+    jest.useFakeTimers();
+    try {
+      const settlements = [];
+      const teardown = runBoundedSessionTeardown({
+        closeContext: () => new Promise(() => {}),
+        emitDestroyed: () => new Promise(() => {}),
+        timeoutMs: 25,
+        onSettlement: (name, result) => settlements.push([name, result.status]),
+      });
+
+      await jest.advanceTimersByTimeAsync(50);
+      await expect(teardown).resolves.toBeUndefined();
+      expect(settlements).toEqual([
+        ['context.close', 'timeout'],
+        ['session:destroyed', 'timeout'],
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a hung page close is attempted once and returns at the cleanup deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      const page = {
+        isClosed: jest.fn(() => false),
+        close: jest.fn(() => new Promise(() => {})),
+        removeAllListeners: jest.fn(),
+      };
+      const onFailure = jest.fn();
+      const closing = closePageWithin(page, { timeoutMs: 25, onFailure });
+      await jest.advanceTimersByTimeAsync(25);
+      await expect(closing).resolves.toBe(false);
+      expect(page.close).toHaveBeenCalledTimes(1);
+      expect(page.removeAllListeners).toHaveBeenCalledTimes(1);
+      expect(onFailure).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('proxy retry closes only the captured failed session, never its replacement', async () => {
+    const failedSession = { name: 'A', closed: false };
+    const replacementSession = { name: 'B', closed: false };
+    const sessions = new Map([['user', replacementSession]]);
+    const closeSession = jest.fn(async (key, session) => {
+      session.closed = true;
+      if (sessions.get(key) === session) sessions.delete(key);
+    });
+    const getSession = jest.fn(async () => sessions.get('user'));
+
+    const result = await replaceSessionAfterProxyFailure({
+      signal: new AbortController().signal,
+      userKey: 'user',
+      failedSession,
+      closeSession,
+      getSession,
+    });
+
+    expect(result).toBe(replacementSession);
+    expect(closeSession).toHaveBeenCalledWith('user', failedSession);
+    expect(failedSession.closed).toBe(true);
+    expect(replacementSession.closed).toBe(false);
+  });
+
+  test('proxy retry cannot rotate after its admission operation is aborted', async () => {
+    const controller = new AbortController();
+    const reason = new Error('timed out');
+    controller.abort(reason);
+    const closeSession = jest.fn();
+    const getSession = jest.fn();
+
+    await expect(replaceSessionAfterProxyFailure({
+      signal: controller.signal,
+      userKey: 'user',
+      failedSession: {},
+      closeSession,
+      getSession,
+    })).rejects.toBe(reason);
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(getSession).not.toHaveBeenCalled();
+  });
+
+  test('proxy retry does not obtain a replacement if abort arrives while closing the failed session', async () => {
+    const controller = new AbortController();
+    const closeGate = deferred();
+    const closeSession = jest.fn(() => closeGate.promise);
+    const getSession = jest.fn();
+    const result = replaceSessionAfterProxyFailure({
+      signal: controller.signal,
+      userKey: 'user',
+      failedSession: {},
+      closeSession,
+      getSession,
+    });
+
+    controller.abort(new Error('timed out during close'));
+    closeGate.resolve();
+    await expect(result).rejects.toThrow('timed out during close');
+    expect(getSession).not.toHaveBeenCalled();
   });
 });

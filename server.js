@@ -38,12 +38,22 @@ import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
 import { BrowserLaunchCoordinator } from './lib/browser-launch-coordinator.js';
+import { collectUserDiagnostics } from './lib/user-diagnostics.js';
 import {
   TabAdmissionController,
   TabCapacityReservations,
+  SessionCreationGenerations,
   canReapEmptySession,
+  closePageWithin,
+  coalesceSessionClose,
+  detachSessionForClose,
+  releaseOnAbort,
+  replaceSessionAfterProxyFailure,
   reservePendingTabCreation,
+  runBoundedSessionTeardown,
   sendTabAdmissionError,
+  settleAllConcurrently,
+  settleWithin,
   withAbortableResource,
 } from './lib/tab-admission.js';
 
@@ -373,7 +383,12 @@ app.post('/sessions/:userId/cookies', authMiddleware(), express.json({ limit: '5
     await session.context.addCookies(sanitized);
     const result = { ok: true, userId: String(userId), count: sanitized.length };
     log('info', 'cookies imported', { reqId: req.reqId, userId: String(userId), count: sanitized.length });
-    pluginEvents.emit('session:cookies:import', { userId: String(userId), count: sanitized.length });
+    await pluginEvents.emitAsync('session:cookies:import', {
+      userId: String(userId),
+      count: sanitized.length,
+      session,
+      context: session.context,
+    });
     res.json(result);
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'set_cookies').inc();
@@ -530,18 +545,12 @@ async function withUserLimit(userId, operation) {
   }
 }
 
-async function safePageClose(page) {
-  if (!page || page.isClosed()) return;
-  try {
-    await Promise.race([
-      page.close({ runBeforeUnload: false }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), PAGE_CLOSE_TIMEOUT_MS)),
-    ]);
-  } catch (e) {
-    log('warn', 'page close timed out or failed, force-closing', { error: e.message });
-    try { await page.close({ runBeforeUnload: false }); } catch (_) {}
-    page.removeAllListeners();
-  }
+async function safePageClose(page, { retainUntilSettled = false } = {}) {
+  await closePageWithin(page, {
+    timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
+    retainUntilSettled,
+    onFailure: (error) => log('warn', 'page close timed out or failed; cleanup abandoned', { error: error.message }),
+  });
 }
 
 // Detect host OS for fingerprint generation
@@ -573,6 +582,7 @@ const tabAdmission = new TabAdmissionController({
   maxActive: TAB_ADMISSION_MAX_ACTIVE,
   maxActivePerUser: TAB_ADMISSION_MAX_ACTIVE_PER_USER,
   maxPending: TAB_ADMISSION_QUEUE_LIMIT,
+  maxAbandoned: TAB_ADMISSION_MAX_ACTIVE,
   waitTimeoutMs: requestTimeoutMs(),
   operationTimeoutMs: requestTimeoutMs(),
   retryAfterSeconds: 2,
@@ -582,6 +592,12 @@ const tabAdmission = new TabAdmissionController({
   },
   onRejected: () => tabAdmissionRejectedTotal.inc(),
   onTimeout: () => tabAdmissionTimeoutsTotal.inc(),
+  onAbandonedLimit: ({ abandoned }) => {
+    log('error', 'tab admission abandoned-operation limit reached; resetting browser generation', { abandoned });
+    void closeBrowserFully('tab_admission_abandoned_limit').catch((error) => {
+      log('error', 'browser generation reset after abandoned operations failed', { error: error.message });
+    });
+  },
 });
 
 async function withTabAdmission(userId, operation) {
@@ -1216,6 +1232,7 @@ function normalizeUserId(userId) {
 }
 
 const sessionCreations = new Map();
+const sessionCreationGenerations = new SessionCreationGenerations();
 
 function clearSessionLocks(session) {
   if (!session?.tabGroups) return;
@@ -1238,7 +1255,13 @@ async function closeSession(userId, session, {
 } = {}) {
   if (!session) return;
 
+  return coalesceSessionClose(session, async () => {
+
   const key = normalizeUserId(userId);
+  // Detach synchronously so a hung context.close() cannot leave an internal
+  // _closing session resident. Identity checking protects a newer session
+  // installed under the same user key from late teardown of the old one.
+  detachSessionForClose(sessions, key, session);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
@@ -1246,32 +1269,57 @@ async function closeSession(userId, session, {
     clearSessionLocks(session);
   }
 
-  if (clearDownloads) {
-    await clearSessionDownloads(session).catch(() => {});
-  }
-
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  const payload = { userId: key, reason, session, context: session.context };
+  const steps = [];
+  if (clearDownloads) steps.push(['session download cleanup', () => clearSessionDownloads(session)]);
+  steps.push(['session:destroying', () => pluginEvents.emitAsyncSettled(
+    'session:destroying',
+    payload,
+    (err) => log('warn', 'session:destroying plugin failed', {
+      userId: key,
+      reason,
+      error: err?.message || String(err),
+    }),
+  )]);
   if (session.tracePath) {
-    try {
-      await session.context.tracing.stop({ path: session.tracePath });
-      log('info', 'tracing saved', { userId: key, path: session.tracePath });
-    } catch (err) {
-      log('warn', 'tracing.stop failed', { userId: key, error: err.message });
-    }
+    steps.push(['tracing.stop', () => session.context.tracing.stop({ path: session.tracePath })]);
   }
 
-  await session.context.close().catch(() => {});
-  sessions.delete(key);
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  await runBoundedSessionTeardown({
+    steps,
+    closeContext: () => session.context.close(),
+    emitDestroyed: () => pluginEvents.emitAsyncSettled(
+      'session:destroyed',
+      payload,
+      (err) => log('warn', 'session:destroyed plugin failed', {
+        userId: key,
+        reason,
+        error: err?.message || String(err),
+      }),
+    ),
+    timeoutMs: 2000,
+    onSettlement: (name, result) => {
+      if (result.status === 'fulfilled') {
+        if (name === 'tracing.stop') log('info', 'tracing saved', { userId: key, path: session.tracePath });
+        return;
+      }
+      log('warn', `${name} ${result.status === 'timeout' ? 'timed out' : 'failed'}`, {
+        userId: key,
+        reason,
+        ...(result.reason ? { error: result.reason?.message || String(result.reason) } : {}),
+      });
+    },
+  });
 
   refreshActiveTabsGauge();
+  });
 }
 
 async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
   const openSessions = Array.from(sessions.entries());
-  for (const [userId, session] of openSessions) {
-    await closeSession(userId, session, { reason, clearDownloads, clearLocks });
-  }
+  await settleAllConcurrently(openSessions, ([userId, session]) => (
+    closeSession(userId, session, { reason, clearDownloads, clearLocks })
+  ));
 }
 
 async function getSession(userId, { trace = false } = {}) {
@@ -1297,6 +1345,11 @@ async function getSession(userId, { trace = false } = {}) {
   
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
+      const creationToken = sessionCreationGenerations.begin(key);
+      try {
+      if (shuttingDown) {
+        throw Object.assign(new Error('Server is shutting down'), { statusCode: 503, code: 'shutting_down' });
+      }
       if (sessions.size >= MAX_SESSIONS) {
         throw Object.assign(
           new Error('Maximum concurrent sessions reached'),
@@ -1344,6 +1397,40 @@ async function getSession(userId, { trace = false } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
+      let contextCleanup = null;
+      const closeInvalidatedContext = () => {
+        if (!contextCleanup) {
+          contextCleanup = settleWithin(Promise.resolve().then(() => context.close()), 2000);
+        }
+        return contextCleanup;
+      };
+      sessionCreationGenerations.setInvalidationHandler(creationToken, () => {
+        void closeInvalidatedContext().then((result) => {
+          if (result.status !== 'fulfilled') {
+            log('warn', 'invalidated in-flight session context cleanup did not complete', {
+              userId: key,
+              status: result.status,
+              ...(result.reason ? { error: result.reason?.message || String(result.reason) } : {}),
+            });
+          }
+        });
+      });
+      const requirePublishable = async () => {
+        if (sessionCreationGenerations.canPublish(creationToken)) return;
+        const closeResult = await closeInvalidatedContext();
+        if (closeResult.status !== 'fulfilled') {
+          log('warn', 'invalidated session creation context cleanup did not complete', {
+            userId: key,
+            status: closeResult.status,
+            ...(closeResult.reason ? { error: closeResult.reason?.message || String(closeResult.reason) } : {}),
+          });
+        }
+        throw Object.assign(new Error('Session creation was invalidated'), {
+          statusCode: 409,
+          code: 'session_creation_invalidated',
+        });
+      };
+      await requirePublishable();
 
       let tracePath = null;
       if (trace) {
@@ -1358,6 +1445,8 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
 
+      await requirePublishable();
+
       const created = {
         context,
         tabGroups: new Map(),
@@ -1366,8 +1455,24 @@ async function getSession(userId, { trace = false } = {}) {
         tracePath,
         _pendingTabCreations: 0,
       };
+      try {
+        await pluginEvents.emitAsync('session:created', {
+          userId: key,
+          context,
+          isCurrent: () => sessionCreationGenerations.canPublish(creationToken),
+        });
+        await requirePublishable();
+      } catch (error) {
+        sessionCreationGenerations.invalidateToken(creationToken);
+        await pluginEvents.emitAsyncSettled('session:destroyed', {
+          userId: key,
+          context,
+          reason: 'session_creation_failed',
+        });
+        await closeInvalidatedContext();
+        throw error;
+      }
       sessions.set(key, created);
-      await pluginEvents.emitAsync('session:created', { userId: key, context });
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
@@ -1375,6 +1480,9 @@ async function getSession(userId, { trace = false } = {}) {
         proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
       });
       return created;
+      } finally {
+        sessionCreationGenerations.finish(creationToken);
+      }
     });
   }
   session.lastAccess = Date.now();
@@ -1789,7 +1897,7 @@ async function camofoxPressureCleanup(options = {}) {
       for (const [listItemId, group] of Array.from(session.tabGroups.entries())) {
         if (group.size === 0) session.tabGroups.delete(listItemId);
       }
-      if (closeEmptySessions && session.tabGroups.size === 0) {
+      if (closeEmptySessions && canReapEmptySession(session)) {
         session._closing = true;
         await closeSession(userId, session, { reason: 'pressure_cleanup_empty_session', clearDownloads: true, clearLocks: true });
         sessionsExpiredTotal.inc();
@@ -2722,7 +2830,7 @@ app.post('/pressure/cleanup', authMiddleware(), async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-app.post('/tabs', async (req, res) => {
+async function createTabHandler(req, res) {
   try {
     const { userId, sessionKey, listItemId, url, trace } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
@@ -2756,13 +2864,13 @@ app.post('/tabs', async (req, res) => {
         );
       }
 
-      const releaseCapacity = tabCapacity.reserve(normalizeUserId(userId));
+      const releaseCapacity = releaseOnAbort(signal, tabCapacity.reserve(normalizeUserId(userId)));
       try {
         const tabId = fly.makeTabId();
         const createAttempt = async (session) => {
           let group;
           let tabState;
-          const releasePendingCreation = reservePendingTabCreation(session);
+          const releasePendingCreation = releaseOnAbort(signal, reservePendingTabCreation(session));
           try {
             return await withAbortableResource({
             create: () => session.context.newPage(),
@@ -2780,7 +2888,7 @@ app.post('/tabs', async (req, res) => {
               if (group?.size === 0) session.tabGroups.delete(resolvedSessionKey);
               refreshActiveTabsGauge();
             },
-            cleanup: safePageClose,
+            cleanup: (page) => safePageClose(page, { retainUntilSettled: true }),
             operation: async (page) => {
               if (url) {
                 const urlErr = validateUrl(url);
@@ -2791,7 +2899,11 @@ app.post('/tabs', async (req, res) => {
               }
               pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
               log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-              return { tabId, url: page.url() };
+              const createdTab = { tabId, url: page.url() };
+              if (req.camofoxLegacyOpen) {
+                createdTab.title = await page.title().catch(() => '');
+              }
+              return createdTab;
             },
             });
           } finally {
@@ -2800,6 +2912,7 @@ app.post('/tabs', async (req, res) => {
         };
 
         let session = await getSession(userId, { trace: !!trace });
+        if (signal.aborted) throw signal.reason;
         try {
           return await createAttempt(session);
         } catch (navErr) {
@@ -2809,11 +2922,14 @@ app.post('/tabs', async (req, res) => {
           });
           browserRestartsTotal.labels('proxy_retry').inc();
           const key = normalizeUserId(userId);
-          const oldSession = sessions.get(key);
-          if (oldSession) {
-            await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-          }
-          session = await getSession(userId, { trace: !!trace });
+          session = await replaceSessionAfterProxyFailure({
+            signal,
+            userKey: key,
+            failedSession: session,
+            closeSession,
+            closeOptions: { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true },
+            getSession: () => getSession(userId, { trace: !!trace }),
+          });
           return createAttempt(session);
         }
       } finally {
@@ -2821,6 +2937,9 @@ app.post('/tabs', async (req, res) => {
       }
     });
 
+    if (req.camofoxLegacyOpen) {
+      return res.json({ ok: true, targetId: result.tabId, ...result });
+    }
     res.json(result);
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
@@ -2846,7 +2965,9 @@ app.post('/tabs', async (req, res) => {
     }
     handleRouteError(err, req, res);
   }
-});
+}
+
+app.post('/tabs', createTabHandler);
 
 // Navigate
 /**
@@ -5106,6 +5227,9 @@ app.delete('/sessions/:userId/traces/:filename', authMiddleware(), async (req, r
 app.delete('/sessions/:userId', authMiddleware(), async (req, res) => {
   try {
     const userId = normalizeUserId(req.params.userId);
+    sessionCreationGenerations.invalidate(userId);
+    const creation = sessionCreations.get(userId);
+    if (creation) await settleWithin(creation, 2000);
     const session = sessions.get(userId);
     if (session) {
       await closeSession(userId, session, { reason: 'api_delete_session', clearDownloads: true, clearLocks: true });
@@ -5119,6 +5243,106 @@ app.delete('/sessions/:userId', authMiddleware(), async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /sessions/{userId}/diagnostics:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Read per-user session and tab diagnostics
+ *     description: Returns in-memory identifiers and counters scoped to one user. It never launches or awaits the browser and omits URLs, titles, cookies, and page content.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Per-user diagnostics, including admission state even when no session exists.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               additionalProperties: false
+ *               required: [userId, generatedAt, session, admission, concurrency, locks, tabs]
+ *               properties:
+ *                 userId: { type: string }
+ *                 generatedAt: { type: integer }
+ *                 session:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [exists, closing, lastAccess, idleMs, pendingTabCreations, tabCount, sessionKeys]
+ *                   properties:
+ *                     exists: { type: boolean }
+ *                     closing: { type: boolean }
+ *                     lastAccess: { type: integer, nullable: true }
+ *                     idleMs: { type: integer, minimum: 0, maximum: 1000000000, nullable: true }
+ *                     pendingTabCreations: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     tabCount: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     sessionKeys:
+ *                       type: array
+ *                       items: { type: string }
+ *                 admission:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, pendingForUser, activeWithoutSession]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     pendingForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     activeWithoutSession: { type: boolean }
+ *                 concurrency:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, queuedForUser]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     queuedForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                 locks:
+ *                   type: object
+ *                   additionalProperties: false
+ *                   required: [activeForUser, queuedForUser]
+ *                   properties:
+ *                     activeForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                     queuedForUser: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                 tabs:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     additionalProperties: false
+ *                     required: [tabId, sessionKey, lock, toolCalls, consecutiveTimeouts, consecutiveFailures]
+ *                     properties:
+ *                       tabId: { type: string }
+ *                       sessionKey: { type: string }
+ *                       lock:
+ *                         type: object
+ *                         additionalProperties: false
+ *                         required: [active, queued]
+ *                         properties:
+ *                           active: { type: boolean }
+ *                           queued: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       toolCalls: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       consecutiveTimeouts: { type: integer, minimum: 0, maximum: 1000000000 }
+ *                       consecutiveFailures: { type: integer, minimum: 0, maximum: 1000000000 }
+ *       403:
+ *         description: Authentication required.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/sessions/:userId/diagnostics', authMiddleware(), (req, res) => {
+  const userId = normalizeUserId(req.params.userId);
+  res.json(collectUserDiagnostics({
+    userId,
+    sessions,
+    tabLocks,
+    userConcurrency,
+    admissionSnapshot: tabAdmission.snapshot(),
+  }));
+});
+
 // Cleanup stale sessions
 setInterval(() => {
   const now = Date.now();
@@ -5127,8 +5351,12 @@ setInterval(() => {
       session._closing = true;
       const idleMs = now - session.lastAccess;
       sessionsExpiredTotal.inc();
-      pluginEvents.emit('session:expired', { userId, idleMs });
-      closeSession(userId, session, { reason: 'session_timeout', clearDownloads: true, clearLocks: true }).catch(() => {});
+      void settleWithin(
+        pluginEvents.emitAsyncSettled('session:expired', { userId, idleMs }),
+        2000,
+      ).finally(() => {
+        closeSession(userId, session, { reason: 'session_timeout', clearDownloads: true, clearLocks: true }).catch(() => {});
+      });
       log('info', 'session expired', { userId });
     }
   }
@@ -5449,81 +5677,18 @@ app.get('/tabs', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-app.post('/tabs/open', async (req, res) => {
-  try {
-    const { url, userId, listItemId = 'default' } = req.body;
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
-    }
-    if (!url) {
-      return res.status(400).json({ error: 'url is required' });
-    }
-    
-    const urlErr = validateUrl(url);
-    if (urlErr) return res.status(400).json({ error: urlErr });
-    
-    let session = await getSession(userId);
-    
-    // Recycle oldest tab when limits are reached instead of rejecting
-    let totalTabs = 0;
-    for (const g of session.tabGroups.values()) totalTabs += g.size;
-    if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId, userId);
-      if (!recycled) {
-        return res.status(429).json({ error: 'Maximum tabs per session reached' });
-      }
-    }
-    
-    let group = getTabGroup(session, listItemId);
-    
-    let page = await session.context.newPage();
-    const tabId = fly.makeTabId();
-    let tabState = createTabState(page);
-    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-    group.set(tabId, tabState);
-    attachPopupHandler(page, userId, listItemId);
-    refreshActiveTabsGauge();
-    
-    try {
-      await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-    } catch (navErr) {
-      if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
-        log('warn', 'tab open failed, retrying with fresh proxy', {
-          reqId: req.reqId, tabId, error: navErr.message,
-        });
-        browserRestartsTotal.labels('proxy_retry').inc();
-        const key = normalizeUserId(userId);
-        const oldSession = sessions.get(key);
-        if (oldSession) {
-          await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-        }
-        session = await getSession(userId);
-        group = getTabGroup(session, listItemId);
-        page = await session.context.newPage();
-        tabState = createTabState(page);
-        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-        group.set(tabId, tabState);
-        attachPopupHandler(page, userId, listItemId);
-        refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-      } else {
-        throw navErr;
-      }
-    }
-    tabState.visitedUrls.add(url);
-    
-    log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
-    res.json({ 
-      ok: true,
-      targetId: tabId,
-      tabId,
-      url: page.url(),
-      title: await page.title().catch(() => '')
-    });
-  } catch (err) {
-    log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
-    handleRouteError(err, req, res);
+app.post('/tabs/open', (req, res) => {
+  const { url, userId, listItemId = 'default' } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
   }
+  if (!url) {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  req.camofoxLegacyOpen = true;
+  req.body = { ...req.body, sessionKey: req.body.sessionKey || listItemId };
+  return createTabHandler(req, res);
 });
 
 // POST /start - Start browser (OpenClaw expects this)
@@ -6165,17 +6330,28 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  sessionCreationGenerations.invalidateAll();
   log('info', 'shutting down', { signal });
-  pluginEvents.emit('server:shutdown', { signal });
 
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
     process.exit(1);
-  }, 10000);
+  }, 30000);
   forceTimeout.unref();
 
   server.close();
   stopMemoryReporter();
+
+  await settleAllConcurrently(Array.from(sessionCreations.values()), (creation) => (
+    settleWithin(creation, 2000)
+  ));
+
+  await settleWithin(
+    pluginEvents.emitAsyncSettled('server:shutdown', { signal }, (err) => {
+      log('warn', 'server:shutdown plugin failed', { signal, error: err?.message || String(err) });
+    }),
+    2000,
+  );
 
   await closeAllSessions(`shutdown:${signal}`, {
     clearDownloads: false,

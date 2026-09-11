@@ -24,6 +24,7 @@
  */
 
 import {
+  CheckpointSequenceRegistry,
   getUserPersistencePaths,
   loadPersistedStorageState,
   persistStorageState,
@@ -48,17 +49,38 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // Track active sessions for checkpoint on close
   const activeSessions = new Map(); // userId -> context
+  const checkpointSequences = new CheckpointSequenceRegistry();
+  const creationValidity = new WeakMap(); // context -> core creation-generation predicate
+
+  function advanceCheckpointSequence(userId) {
+    return checkpointSequences.advance(userId);
+  }
 
   /**
    * Checkpoint storage state to disk for a userId.
    */
   async function checkpoint(userId, context, reason) {
     if (!context) return;
-    const result = await persistStorageState({ profileDir, userId, context, logger });
-    if (result.persisted) {
-      log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+    const sequence = advanceCheckpointSequence(userId);
+    try {
+      const result = await persistStorageState({
+        profileDir,
+        userId,
+        context,
+        logger,
+        shouldPublish: () => (
+          (creationValidity.get(context)?.() ?? true)
+          && activeSessions.get(userId) === context
+          && checkpointSequences.current(userId) === sequence
+        ),
+      });
+      if (result.persisted) {
+        log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
+      }
+      return result;
+    } finally {
+      checkpointSequences.forgetIfCurrent(userId, sequence, activeSessions.has(userId));
     }
-    return result;
   }
 
   // --- Lifecycle hooks ---
@@ -74,17 +96,35 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // After session is created: import bootstrap cookies if no persisted state,
   // and track the context for later checkpointing
-  events.on('session:created', async ({ userId, context }) => {
+  events.on('session:created', async ({ userId, context, isCurrent = () => true }) => {
+    if (!isCurrent()) return;
+    // Invalidate any late checkpoint from the previous session generation.
+    advanceCheckpointSequence(userId);
     activeSessions.set(userId, context);
+    creationValidity.set(context, isCurrent);
+    const stopIfInvalidated = () => {
+      if (isCurrent()) return false;
+      advanceCheckpointSequence(userId);
+      if (activeSessions.get(userId) === context) activeSessions.delete(userId);
+      creationValidity.delete(context);
+      checkpointSequences.forgetIfCurrent(
+        userId,
+        checkpointSequences.current(userId),
+        activeSessions.has(userId),
+      );
+      return true;
+    };
 
     // If no persisted state was restored, try bootstrap cookies
     const existingState = await loadPersistedStorageState(profileDir, userId, logger);
+    if (stopIfInvalidated()) return;
     if (!existingState) {
       const result = await importBootstrapCookies({
         cookiesDir: config.cookiesDir,
         context,
         logger,
       });
+      if (stopIfInvalidated()) return;
       if (result.imported > 0) {
         log('info', 'bootstrap cookies imported', { userId, count: result.imported, source: result.source });
         await checkpoint(userId, context, 'bootstrap_cookies');
@@ -93,32 +133,37 @@ export async function register(app, ctx, pluginConfig = {}) {
   });
 
   // On cookie import: checkpoint
-  events.on('session:cookies:import', async ({ userId }) => {
-    const context = activeSessions.get(userId);
-    if (context) {
-      await checkpoint(userId, context, 'cookie_import');
-    }
+  events.on('session:cookies:import', async ({ userId, context }) => {
+    if (!context) return;
+    await checkpoint(userId, context, 'cookie_import');
   });
 
   // On session destroying (pre-close): checkpoint while context is still alive
-  events.on('session:destroying', async ({ userId, reason }) => {
-    const context = activeSessions.get(userId);
-    if (context) {
-      await checkpoint(userId, context, reason).catch(() => {});
-      activeSessions.delete(userId);
-    }
+  events.on('session:destroying', async ({ userId, context, reason }) => {
+    if (!context || activeSessions.get(userId) !== context) return;
+    await checkpoint(userId, context, reason).catch(() => {});
+    if (activeSessions.get(userId) === context) activeSessions.delete(userId);
+    creationValidity.delete(context);
+    checkpointSequences.forgetIfCurrent(
+      userId,
+      checkpointSequences.current(userId),
+      activeSessions.has(userId),
+    );
   });
 
   // On session destroyed (post-close): cleanup tracking if not already done
-  events.on('session:destroyed', async ({ userId }) => {
-    activeSessions.delete(userId);
+  events.on('session:destroyed', async ({ userId, context }) => {
+    if (context && activeSessions.get(userId) === context) {
+      advanceCheckpointSequence(userId);
+      activeSessions.delete(userId);
+    }
+    if (context) creationValidity.delete(context);
+    checkpointSequences.forgetIfCurrent(
+      userId,
+      checkpointSequences.current(userId),
+      activeSessions.has(userId),
+    );
   });
 
-  // On shutdown: checkpoint all remaining sessions
-  events.on('server:shutdown', async () => {
-    for (const [userId, context] of activeSessions) {
-      await checkpoint(userId, context, 'shutdown').catch(() => {});
-    }
-    activeSessions.clear();
-  });
+  // Shutdown checkpoints are owned by session:destroying while contexts are alive.
 }

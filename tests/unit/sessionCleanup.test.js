@@ -8,6 +8,134 @@
  * 4. Session expiry sets _closing before teardown
  */
 
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import {
+  SessionCreationGenerations,
+  coalesceSessionClose,
+  detachSessionForClose,
+} from '../../lib/tab-admission.js';
+
+describe('session close registry detachment', () => {
+  test('delete invalidation prevents an in-flight creation from publishing', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+
+    expect(generations.canPublish(token)).toBe(true);
+    generations.invalidate('user-1');
+    expect(generations.canPublish(token)).toBe(false);
+    expect(generations.canPublish(generations.begin('user-1'))).toBe(true);
+  });
+
+  test('shutdown invalidation prevents every captured creation from publishing', () => {
+    const generations = new SessionCreationGenerations();
+    const first = generations.begin('user-1');
+    const second = generations.begin('user-2');
+
+    generations.invalidateAll();
+    expect(generations.canPublish(first)).toBe(false);
+    expect(generations.canPublish(second)).toBe(false);
+  });
+
+  test('a published creation remains current until a later global invalidation', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+
+    generations.finish(token);
+    expect(generations.canPublish(token)).toBe(true);
+    generations.invalidateAll();
+    expect(generations.canPublish(token)).toBe(false);
+  });
+
+  test('failed creation invalidates its exact token and starts attached context cleanup', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+    let cleanups = 0;
+    generations.setInvalidationHandler(token, () => { cleanups += 1; });
+
+    generations.invalidateToken(token);
+    generations.finish(token);
+
+    expect(generations.canPublish(token)).toBe(false);
+    expect(cleanups).toBe(1);
+  });
+
+  test('server wires creation invalidation into delete, shutdown, and publication', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const getSessionSource = source.slice(
+      source.indexOf('async function getSession('),
+      source.indexOf('\nfunction touchSession(', source.indexOf('async function getSession(')),
+    );
+    const deleteSource = source.slice(
+      source.indexOf("app.delete('/sessions/:userId'"),
+      source.indexOf("app.get('/sessions/:userId/diagnostics'"),
+    );
+    const shutdownSource = source.slice(
+      source.indexOf('async function gracefulShutdown('),
+      source.indexOf("process.on('SIGTERM'"),
+    );
+
+    expect(getSessionSource).toContain('sessionCreationGenerations.begin(key)');
+    expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
+    expect(getSessionSource).toContain('sessionCreationGenerations.setInvalidationHandler(creationToken');
+    expect(getSessionSource).toContain('sessionCreationGenerations.invalidateToken(creationToken)');
+    expect(getSessionSource.indexOf("pluginEvents.emitAsync('session:created'")).toBeLessThan(
+      getSessionSource.indexOf('sessions.set(key, created)'),
+    );
+    expect(getSessionSource).toContain('isCurrent: () => sessionCreationGenerations.canPublish(creationToken)');
+    expect(getSessionSource).toContain("reason: 'session_creation_failed'");
+    expect(deleteSource).toContain('sessionCreationGenerations.invalidate(userId)');
+    expect(deleteSource).toContain('sessionCreations.get(userId)');
+    expect(shutdownSource).toContain('sessionCreationGenerations.invalidateAll()');
+    expect(shutdownSource).toContain('Array.from(sessionCreations.values())');
+  });
+
+  test('coalesces concurrent teardown calls for the same session', async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const session = {};
+    let calls = 0;
+    const first = coalesceSessionClose(session, async () => { calls += 1; await gate; });
+    const second = coalesceSessionClose(session, async () => { calls += 1; });
+
+    expect(second).toBe(first);
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    release();
+    await Promise.all([first, second]);
+  });
+
+  test('production closeSession delegates the entire teardown to the once guard', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const closeStart = source.indexOf('async function closeSession(');
+    const closeEnd = source.indexOf('\nasync function closeAllSessions(', closeStart);
+    const closeSource = source.slice(closeStart, closeEnd);
+
+    expect(closeSource).toContain('return coalesceSessionClose(session, async () => {');
+  });
+
+  test('detaches the exact session before asynchronous context cleanup settles', () => {
+    const session = { _closing: false };
+    const sessions = new Map([['internal-user', session]]);
+
+    expect(detachSessionForClose(sessions, 'internal-user', session)).toBe(true);
+    expect(session._closing).toBe(true);
+    expect(sessions.has('internal-user')).toBe(false);
+  });
+
+  test('never deletes a replacement session installed under the same user key', () => {
+    const stale = { _closing: true };
+    const replacement = { _closing: false };
+    const sessions = new Map([['internal-user', replacement]]);
+
+    expect(detachSessionForClose(sessions, 'internal-user', stale)).toBe(false);
+    expect(sessions.get('internal-user')).toBe(replacement);
+  });
+});
+
 describe('session cleanup after tab reaper', () => {
   // Simulate the reaper loop logic from server.js (with _closing flag)
   function runTabReaper({ sessions, TAB_INACTIVITY_MS, destroyTab, onSessionEmpty }) {

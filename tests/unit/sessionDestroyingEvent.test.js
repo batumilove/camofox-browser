@@ -26,9 +26,9 @@ describe('session:destroying event ordering', () => {
    *   3. pluginEvents.emitAsync('session:destroyed', ...)
    */
   async function simulateCloseSession(pluginEvents, session, userId, reason) {
-    await pluginEvents.emitAsync('session:destroying', { userId, reason });
+    await pluginEvents.emitAsyncSettled('session:destroying', { userId, reason, session, context: session.context });
     await session.context.close();
-    await pluginEvents.emitAsync('session:destroyed', { userId, reason });
+    await pluginEvents.emitAsyncSettled('session:destroyed', { userId, reason, session, context: session.context });
   }
 
   function makeMockContext() {
@@ -124,14 +124,27 @@ describe('session:destroying event ordering', () => {
       destroyedCalled = true;
     });
 
-    // emitAsync uses Promise.all which rejects on first error,
-    // but the real server.js should handle this. Test the behavior.
-    await expect(simulateCloseSession(events, session, 'user-1', 'test'))
-      .rejects.toThrow('plugin exploded');
+    await expect(simulateCloseSession(events, session, 'user-1', 'test')).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(destroyedCalled).toBe(true);
+  });
 
-    // With Promise.all, destroyed won't fire if destroying rejects.
-    // This documents the current behavior -- server.js should wrap in try/catch.
-    expect(destroyedCalled).toBe(false);
+  test('destroyed still fires if a destroying listener throws synchronously', async () => {
+    const events = createPluginEvents();
+    const context = makeMockContext();
+    const session = { context };
+    let destroyedCalled = false;
+
+    events.on('session:destroying', () => {
+      throw new Error('synchronous plugin explosion');
+    });
+    events.on('session:destroyed', () => {
+      destroyedCalled = true;
+    });
+
+    await expect(simulateCloseSession(events, session, 'user-1', 'test')).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(destroyedCalled).toBe(true);
   });
 
   test('multiple plugins can checkpoint during destroying', async () => {
@@ -192,16 +205,14 @@ describe('persistence plugin with session:destroying', () => {
       activeSessions.set(userId, context);
     });
 
-    events.on('session:destroying', async ({ userId, reason }) => {
-      const context = activeSessions.get(userId);
-      if (context) {
-        await checkpoint(userId, context, reason).catch(() => {});
-        activeSessions.delete(userId);
-      }
+    events.on('session:destroying', async ({ userId, context, reason }) => {
+      if (!context || activeSessions.get(userId) !== context) return;
+      await checkpoint(userId, context, reason).catch(() => {});
+      if (activeSessions.get(userId) === context) activeSessions.delete(userId);
     });
 
-    events.on('session:destroyed', async ({ userId }) => {
-      activeSessions.delete(userId);
+    events.on('session:destroyed', async ({ userId, context }) => {
+      if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
     });
 
     return { activeSessions, checkpointCalls };
@@ -220,9 +231,9 @@ describe('persistence plugin with session:destroying', () => {
   }
 
   async function simulateCloseSession(pluginEvents, session, userId, reason) {
-    await pluginEvents.emitAsync('session:destroying', { userId, reason });
+    await pluginEvents.emitAsync('session:destroying', { userId, reason, session, context: session.context });
     await session.context.close();
-    await pluginEvents.emitAsync('session:destroyed', { userId, reason });
+    await pluginEvents.emitAsync('session:destroyed', { userId, reason, session, context: session.context });
   }
 
   test('checkpoints successfully during destroying (context alive)', async () => {
@@ -250,11 +261,11 @@ describe('persistence plugin with session:destroying', () => {
     await events.emitAsync('session:created', { userId: 'user-1', context });
 
     // destroying removes from activeSessions
-    await events.emitAsync('session:destroying', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroying', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
 
     // destroyed is a no-op (already removed) but doesn't error
-    await events.emitAsync('session:destroyed', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroyed', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
   });
 
@@ -267,7 +278,7 @@ describe('persistence plugin with session:destroying', () => {
     expect(activeSessions.has('user-1')).toBe(true);
 
     // Skip destroying, go straight to destroyed (backward compat scenario)
-    await events.emitAsync('session:destroyed', { userId: 'user-1', reason: 'test' });
+    await events.emitAsync('session:destroyed', { userId: 'user-1', context, reason: 'test' });
     expect(activeSessions.has('user-1')).toBe(false);
   });
 

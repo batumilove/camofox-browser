@@ -57,7 +57,7 @@ describe('persistence plugin', () => {
 
     // Simulate session created then cookie import
     await events.emitAsync('session:created', { userId: 'user-2', context: mockContext });
-    await events.emitAsync('session:cookies:import', { userId: 'user-2' });
+    await events.emitAsync('session:cookies:import', { userId: 'user-2', context: mockContext });
 
     expect(mockContext.storageState).toHaveBeenCalled();
 
@@ -66,6 +66,30 @@ describe('persistence plugin', () => {
     const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-2');
     const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
     expect(saved.cookies[0].name).toBe('x');
+  });
+
+  test('late cookie import checkpoints its exact context, not the replacement session', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    const contextA = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'a' }], origins: [] }));
+      }),
+    };
+    const contextB = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'b' }], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextA });
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextB });
+    await events.emitAsync('session:cookies:import', {
+      userId: 'race-user',
+      context: contextA,
+    });
+
+    expect(contextA.storageState).toHaveBeenCalledTimes(1);
+    expect(contextB.storageState).not.toHaveBeenCalled();
   });
 
   test('checkpoints on session:destroying', async () => {
@@ -78,9 +102,159 @@ describe('persistence plugin', () => {
     };
 
     await events.emitAsync('session:created', { userId: 'user-3', context: mockContext });
-    await events.emitAsync('session:destroying', { userId: 'user-3', reason: 'test' });
+    await events.emitAsync('session:destroying', { userId: 'user-3', context: mockContext, reason: 'test' });
 
     expect(mockContext.storageState).toHaveBeenCalled();
+  });
+
+  test('late destruction of session A neither checkpoints nor untracks replacement session B', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseCheckpoint, markCheckpointStarted;
+    const checkpointStarted = new Promise((resolve) => { markCheckpointStarted = resolve; });
+    const checkpointGate = new Promise((resolve) => { releaseCheckpoint = resolve; });
+    const contextA = {
+      storageState: jest.fn(async ({ path: p }) => {
+        markCheckpointStarted();
+        await checkpointGate;
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+    const contextB = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextA });
+    const destroyingA = events.emitAsync('session:destroying', {
+      userId: 'race-user',
+      context: contextA,
+      reason: 'proxy_retry_rotate',
+    });
+    await checkpointStarted;
+    expect(contextA.storageState).toHaveBeenCalledTimes(1);
+
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextB });
+    releaseCheckpoint();
+    await destroyingA;
+    await events.emitAsync('session:destroyed', {
+      userId: 'race-user',
+      context: contextA,
+      reason: 'proxy_retry_rotate',
+    });
+    await events.emitAsync('session:cookies:import', { userId: 'race-user', context: contextB });
+
+    expect(contextA.storageState).toHaveBeenCalledTimes(1);
+    expect(contextB.storageState).toHaveBeenCalledTimes(1);
+  });
+
+  test('late checkpoint from replaced context cannot overwrite replacement state', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseOld, markOldStarted;
+    const oldStarted = new Promise((resolve) => { markOldStarted = resolve; });
+    const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+    const contextA = {
+      storageState: jest.fn(async ({ path: p }) => {
+        markOldStarted();
+        await oldGate;
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'stale-a' }], origins: [] }));
+      }),
+    };
+    const contextB = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'current-b' }], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextA });
+    const oldCheckpoint = events.emitAsync('session:cookies:import', {
+      userId: 'race-user',
+      context: contextA,
+    });
+    await oldStarted;
+    await events.emitAsync('session:created', { userId: 'race-user', context: contextB });
+    await events.emitAsync('session:cookies:import', {
+      userId: 'race-user',
+      context: contextB,
+    });
+    releaseOld();
+    await oldCheckpoint;
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'race-user');
+    const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(saved.cookies[0].name).toBe('current-b');
+  });
+
+  test('newer checkpoint from the same context wins over an older slow checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    let releaseOld, markOldStarted;
+    const oldStarted = new Promise((resolve) => { markOldStarted = resolve; });
+    const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+    let call = 0;
+    const context = {
+      storageState: jest.fn(async ({ path: p }) => {
+        call += 1;
+        if (call === 1) {
+          markOldStarted();
+          await oldGate;
+          await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'older' }], origins: [] }));
+          return;
+        }
+        await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'newer' }], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'same-context', context });
+    const older = events.emitAsync('session:cookies:import', { userId: 'same-context', context });
+    await oldStarted;
+    await events.emitAsync('session:cookies:import', { userId: 'same-context', context });
+    releaseOld();
+    await older;
+
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'same-context');
+    const saved = JSON.parse(await fs.readFile(storageStatePath, 'utf8'));
+    expect(saved.cookies[0].name).toBe('newer');
+  });
+
+  test('invalidated creation cannot publish a late bootstrap checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    await fs.mkdir(ctx.config.cookiesDir, { recursive: true });
+    await fs.writeFile(
+      path.join(ctx.config.cookiesDir, 'cookies.txt'),
+      '.example.com\tTRUE\t/\tFALSE\t2147483647\tsession\tstale\n',
+    );
+
+    let current = true;
+    let releaseImport;
+    let markImportStarted;
+    const importStarted = new Promise((resolve) => { markImportStarted = resolve; });
+    const importGate = new Promise((resolve) => { releaseImport = resolve; });
+    const context = {
+      addCookies: jest.fn(async () => {
+        markImportStarted();
+        await importGate;
+      }),
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [{ name: 'stale' }], origins: [] }));
+      }),
+    };
+
+    const creating = events.emitAsync('session:created', {
+      userId: 'invalidated-user',
+      context,
+      isCurrent: () => current,
+    });
+    await importStarted;
+    current = false;
+    releaseImport();
+    await creating;
+
+    expect(context.storageState).not.toHaveBeenCalled();
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'invalidated-user');
+    await expect(fs.stat(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
