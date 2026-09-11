@@ -137,13 +137,34 @@ describe('OpenAPI spec', () => {
     expect(createTab.requestBody.content['application/json']).toBeDefined();
   });
 
-  test('POST /tabs documents both admission timeout 429 causes', () => {
+  test('POST /tabs documents the exhaustive 429 code set', () => {
     const response = spec.paths['/tabs']?.post?.responses?.['429'];
     expect(response).toBeDefined();
-    const serialized = JSON.stringify(response);
-    expect(serialized).toContain('tab_admission_wait_timeout');
-    expect(serialized).toContain('tab_admission_operation_timeout');
-    expect(serialized).toContain('Retry-After');
+    const codeEnum = response.content['application/json'].schema.allOf[1].properties.code.enum;
+    expect(new Set(codeEnum)).toEqual(new Set([
+      'tab_admission_wait_saturated',
+      'tab_admission_wait_timeout',
+      'tab_admission_operation_timeout',
+      'tab_admission_abandoned_saturated',
+      'tab_capacity_reached',
+    ]));
+    expect(response.headers).toHaveProperty('Retry-After');
+  });
+
+  test('POST /tabs documents the exhaustive 503 code set', () => {
+    const response = spec.paths['/tabs']?.post?.responses?.['503'];
+    expect(response).toBeDefined();
+    const codeEnum = response.content['application/json'].schema.allOf[1].properties.code.enum;
+    expect(new Set(codeEnum)).toEqual(new Set([
+      'tab_admission_shutting_down',
+      'browser_stopping',
+      'session_closing',
+      'admission_rejected',
+      'browser_launch_timeout',
+      'session_expired',
+    ]));
+    expect(response.headers).toHaveProperty('Retry-After');
+    expect(response.headers['Retry-After'].description).toContain('admission');
   });
 
   test('legacy routes are marked deprecated', () => {

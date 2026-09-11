@@ -63,6 +63,7 @@ import { TabAdmissionController, TabAdmissionError, createTabAdmissionShutdownEr
 import { createSessionCloseCoordinator } from './lib/session-close.js';
 import { CapacityReservations } from './lib/capacity-reservations.js';
 import { BrowserStopCoordinator } from './lib/browser-stop-coordinator.js';
+import { nextBrowserStopReason, shouldSuppressBrowserWarmRetry } from './lib/browser-warm-retry.js';
 import { runBoundedShutdownPhases } from './lib/shutdown-budget.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
@@ -789,9 +790,28 @@ function camoufoxInstallRemediation() {
 }
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || browser || browserLaunchPromise) return;
+  const retryGeneration = browserLaunchGeneration;
+  if (
+    browserWarmRetryTimer ||
+    browser ||
+    browserLaunchPromise ||
+    shouldSuppressBrowserWarmRetry({
+      isStopping: browserStopCoordinator.isStopping(),
+      retryGeneration,
+      currentGeneration: browserLaunchGeneration,
+      lastStopReason: _lastBrowserStopReason,
+      intentionalStopReasons: INTENTIONAL_STOP_REASONS,
+    })
+  ) return;
   browserWarmRetryTimer = setTimeout(async () => {
     browserWarmRetryTimer = null;
+    if (shouldSuppressBrowserWarmRetry({
+      isStopping: browserStopCoordinator.isStopping(),
+      retryGeneration,
+      currentGeneration: browserLaunchGeneration,
+      lastStopReason: _lastBrowserStopReason,
+      intentionalStopReasons: INTENTIONAL_STOP_REASONS,
+    })) return;
     try {
       const start = Date.now();
       await ensureBrowser();
@@ -804,10 +824,24 @@ function scheduleBrowserWarmRetry(delayMs = 5000) {
         });
         return;
       }
+      if (shouldSuppressBrowserWarmRetry({
+        isStopping: browserStopCoordinator.isStopping(),
+        retryGeneration,
+        currentGeneration: browserLaunchGeneration,
+        lastStopReason: _lastBrowserStopReason,
+        intentionalStopReasons: INTENTIONAL_STOP_REASONS,
+      })) return;
       log('warn', 'background browser warm retry failed', { error: err.message, nextDelayMs: delayMs });
       scheduleBrowserWarmRetry(Math.min(delayMs * 2, 30000));
     }
   }, delayMs);
+}
+
+function clearBrowserWarmRetry() {
+  if (browserWarmRetryTimer) {
+    clearTimeout(browserWarmRetryTimer);
+    browserWarmRetryTimer = null;
+  }
 }
 
 // --- Browser health tracking ---
@@ -1037,6 +1071,12 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
  * clean temp profiles -> verify FD/handle drop.
  */
 async function closeBrowserFully(reason) {
+  _lastBrowserStopReason = nextBrowserStopReason({
+    currentReason: _lastBrowserStopReason,
+    incomingReason: reason,
+    closeInFlight: Boolean(_browserClosePromise),
+    intentionalStopReasons: INTENTIONAL_STOP_REASONS,
+  });
   if (_browserClosePromise) return _browserClosePromise;
   _browserClosePromise = _closeBrowserFullyImpl(reason);
   try {
@@ -1068,9 +1108,6 @@ async function _closeBrowserFullyImpl(reason) {
   ].map(proc => [`${proc.pid}:${proc.startTime}`, proc])).values()];
   const preCloseFds = _countOpenFds();
   const preCloseHandles = _countActiveHandles();
-
-  // Track stop reason for health semantics
-  _lastBrowserStopReason = reason;
 
   // Null the ref so new requests don't use a dying browser
   browser = null;
@@ -1588,6 +1625,14 @@ async function getSession(userId, { trace = false } = {}) {
           log('warn', 'tracing.start failed; session will not be traced', { userId: key, error: err.message });
           tracePath = null;
         }
+      }
+
+      // Tracing startup is asynchronous. Re-check immediately before
+      // publication so /stop cannot miss an unpublished context and return
+      // while this creation subsequently enters the session registry.
+      if (browserStopCoordinator.isStopping() || creationGeneration !== browserLaunchGeneration) {
+        await context.close().catch(() => {});
+        throw browserStoppingError();
       }
 
       const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
@@ -3083,7 +3128,7 @@ app.post('/pressure/cleanup', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       429:
- *         description: Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), or timed out while creating the tab (`tab_admission_operation_timeout`).
+ *         description: Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), timed out while creating the tab (`tab_admission_operation_timeout`), or tab capacity remained exhausted after recycling (`tab_capacity_reached`).
  *         headers:
  *           Retry-After:
  *             description: Seconds to wait before retrying.
@@ -3098,12 +3143,12 @@ app.post('/pressure/cleanup', async (req, res) => {
  *                   properties:
  *                     code:
  *                       type: string
- *                       enum: [tab_admission_wait_saturated, tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated]
+ *                       enum: [tab_admission_wait_saturated, tab_admission_wait_timeout, tab_admission_operation_timeout, tab_admission_abandoned_saturated, tab_capacity_reached]
  *       503:
- *         description: Admission was rejected because the server is shutting down (`tab_admission_shutting_down`).
+ *         description: Admission was rejected because tab admission is shutting down (`tab_admission_shutting_down`), the browser is stopping (`browser_stopping`), the user's existing session is closing (`session_closing`), session/memory capacity rejected creation (`admission_rejected`), browser launch timed out (`browser_launch_timeout`), or the browser session expired (`session_expired`).
  *         headers:
  *           Retry-After:
- *             description: Seconds to wait before retrying.
+ *             description: Seconds to wait before retrying; present for coordinated tab-admission and browser-stop rejections.
  *             schema:
  *               type: integer
  *         content:
@@ -3115,7 +3160,7 @@ app.post('/pressure/cleanup', async (req, res) => {
  *                   properties:
  *                     code:
  *                       type: string
- *                       enum: [tab_admission_shutting_down]
+ *                       enum: [tab_admission_shutting_down, browser_stopping, session_closing, admission_rejected, browser_launch_timeout, session_expired]
  *       409:
  *         description: Cannot enable tracing on an existing session.
  *         content:
@@ -6644,6 +6689,7 @@ app.post('/tabs/open', async (req, res) => {
 app.post('/start', async (req, res) => {
   try {
     await ensureBrowser();
+    _lastBrowserStopReason = null;
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -6689,6 +6735,7 @@ app.post('/stop', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     await browserStopCoordinator.run(async () => {
+      clearBrowserWarmRetry();
       const invalidatedLaunch = invalidateBrowserLaunch();
       await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
       await invalidatedLaunch?.catch((err) => {

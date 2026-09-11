@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "camofox-browser",
-    "version": "1.14.0",
+    "version": "1.15.0",
     "description": "Anti-detection browser automation server for AI agents. Accessibility snapshots, element refs, session isolation, cookie import, proxy rotation, and structured logs.",
     "license": {
       "name": "MIT",
@@ -456,6 +456,15 @@
                     },
                     "url": {
                       "type": "string"
+                    },
+                    "httpStatus": {
+                      "type": "integer",
+                      "nullable": true,
+                      "description": "HTTP status of the optional initial document navigation."
+                    },
+                    "navigationOk": {
+                      "type": "boolean",
+                      "description": "False when the optional initial document navigation returned HTTP 400 or higher."
                     }
                   }
                 }
@@ -483,7 +492,7 @@
             }
           },
           "429": {
-            "description": "Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), or timed out while creating the tab (`tab_admission_operation_timeout`).",
+            "description": "Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), timed out while creating the tab (`tab_admission_operation_timeout`), or tab capacity remained exhausted after recycling (`tab_capacity_reached`).",
             "headers": {
               "Retry-After": {
                 "description": "Seconds to wait before retrying.",
@@ -508,7 +517,8 @@
                             "tab_admission_wait_saturated",
                             "tab_admission_wait_timeout",
                             "tab_admission_operation_timeout",
-                            "tab_admission_abandoned_saturated"
+                            "tab_admission_abandoned_saturated",
+                            "tab_capacity_reached"
                           ]
                         }
                       }
@@ -519,10 +529,10 @@
             }
           },
           "503": {
-            "description": "Admission was rejected because the server is shutting down (`tab_admission_shutting_down`).",
+            "description": "Admission was rejected because tab admission is shutting down (`tab_admission_shutting_down`), the browser is stopping (`browser_stopping`), the user's existing session is closing (`session_closing`), session/memory capacity rejected creation (`admission_rejected`), browser launch timed out (`browser_launch_timeout`), or the browser session expired (`session_expired`).",
             "headers": {
               "Retry-After": {
-                "description": "Seconds to wait before retrying.",
+                "description": "Seconds to wait before retrying; present for coordinated tab-admission and browser-stop rejections.",
                 "schema": {
                   "type": "integer"
                 }
@@ -541,7 +551,12 @@
                         "code": {
                           "type": "string",
                           "enum": [
-                            "tab_admission_shutting_down"
+                            "tab_admission_shutting_down",
+                            "browser_stopping",
+                            "session_closing",
+                            "admission_rejected",
+                            "browser_launch_timeout",
+                            "session_expired"
                           ]
                         }
                       }
@@ -665,11 +680,31 @@
         },
         "responses": {
           "200": {
-            "description": "Navigation result with snapshot.",
+            "description": "Navigation result. Destination HTTP status is reported even when a rendered error page is available.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "tabId": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "httpStatus": {
+                      "type": "integer",
+                      "nullable": true,
+                      "description": "HTTP status of the final document navigation when available."
+                    },
+                    "navigationOk": {
+                      "type": "boolean",
+                      "description": "False when the final document returned an HTTP status of 400 or greater."
+                    }
+                  }
                 }
               }
             }
@@ -766,6 +801,10 @@
                     },
                     "snapshot": {
                       "type": "string"
+                    },
+                    "structure": {
+                      "type": "object",
+                      "description": "Optional bounded read-only DOM summary of forms and tables. The snapshot field remains unchanged."
                     },
                     "refsCount": {
                       "type": "integer"
@@ -1133,6 +1172,85 @@
           },
           "409": {
             "description": "Page changed or target became invalid; caller should take a fresh snapshot and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tabs/{tabId}/select": {
+      "post": {
+        "tags": [
+          "Interaction"
+        ],
+        "summary": "Select a native form option",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId",
+                  "option"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "ref": {
+                    "type": "string"
+                  },
+                  "selector": {
+                    "type": "string"
+                  },
+                  "option": {
+                    "type": "string",
+                    "description": "Visible option label or HTML value."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Option selected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
             "content": {
               "application/json": {
                 "schema": {

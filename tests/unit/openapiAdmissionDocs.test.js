@@ -11,7 +11,13 @@ test('POST /tabs JSDoc advertises both admission timeout codes and Retry-After',
   expect(routeDoc).toContain('tab_admission_wait_timeout');
   expect(routeDoc).toContain('tab_admission_operation_timeout');
   expect(routeDoc).toContain('tab_admission_wait_saturated');
+  expect(routeDoc).toContain('tab_capacity_reached');
   expect(routeDoc).toContain('tab_admission_shutting_down');
+  expect(routeDoc).toContain('browser_stopping');
+  expect(routeDoc).toContain('session_closing');
+  expect(routeDoc).toContain('admission_rejected');
+  expect(routeDoc).toContain('browser_launch_timeout');
+  expect(routeDoc).toContain('session_expired');
   expect(routeDoc).toMatch(/503:/);
   expect(routeDoc).toContain('Retry-After');
 });

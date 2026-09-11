@@ -47,8 +47,10 @@ describe('session close coordination', () => {
   test('context close failures remain observable to the registry owner', async () => {
     const coordinator = createSessionCloseCoordinator();
     const session = { context: { close: jest.fn(async () => { throw new Error('still alive'); }) } };
+    const emitDestroyed = jest.fn(async () => {});
 
-    await expect(coordinator.close(session)).rejects.toThrow('still alive');
+    await expect(coordinator.close(session, { emitDestroyed })).rejects.toThrow('still alive');
+    expect(emitDestroyed).not.toHaveBeenCalled();
   });
 
   test('server delegates closeSession teardown to the coordinator', () => {

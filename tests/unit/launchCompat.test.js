@@ -63,10 +63,10 @@ describe('launch compatibility source contract', () => {
   test('falls back when optional GeoIP setup is unavailable', () => {
     const geoipFallback = sourceBetween(
       'function isCamoufoxGeoipError',
-      'async function launchBrowserInstance()'
+      'async function launchBrowserInstance(launchGeneration)'
     );
     const launchBrowser = sourceBetween(
-      'async function launchBrowserInstance()',
+      'async function launchBrowserInstance(launchGeneration)',
       'async function ensureBrowser()'
     );
 

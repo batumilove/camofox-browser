@@ -212,5 +212,6 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(source).toMatch(/app\.post\('\/stop'[\s\S]*?browserStopCoordinator\.run[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?await invalidatedLaunch\?\.catch[\s\S]*?closeBrowserFully\('admin_stop'\)/);
   expect(source).toMatch(/async function ensureBrowser[\s\S]*?assertBrowserLaunchAllowed\(\)/);
   expect(source).toMatch(/async function getSession[\s\S]*?const creationGeneration = browserLaunchGeneration[\s\S]*?creationGeneration !== browserLaunchGeneration[\s\S]*?context\.close\(\)/);
+  expect(source).toMatch(/context\.tracing\.start[\s\S]*?creationGeneration !== browserLaunchGeneration[\s\S]*?sessions\.set\(key, created\)/);
   expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?Promise\.all\(\[[\s\S]*?invalidatedLaunch\?\.catch/);
 });
