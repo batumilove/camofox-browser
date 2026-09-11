@@ -11,9 +11,57 @@
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { coalesceSessionClose, detachSessionForClose } from '../../lib/tab-admission.js';
+import {
+  SessionCreationGenerations,
+  coalesceSessionClose,
+  detachSessionForClose,
+} from '../../lib/tab-admission.js';
 
 describe('session close registry detachment', () => {
+  test('delete invalidation prevents an in-flight creation from publishing', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+
+    expect(generations.canPublish(token)).toBe(true);
+    generations.invalidate('user-1');
+    expect(generations.canPublish(token)).toBe(false);
+    expect(generations.canPublish(generations.begin('user-1'))).toBe(true);
+  });
+
+  test('shutdown invalidation prevents every captured creation from publishing', () => {
+    const generations = new SessionCreationGenerations();
+    const first = generations.begin('user-1');
+    const second = generations.begin('user-2');
+
+    generations.invalidateAll();
+    expect(generations.canPublish(first)).toBe(false);
+    expect(generations.canPublish(second)).toBe(false);
+  });
+
+  test('server wires creation invalidation into delete, shutdown, and publication', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const getSessionSource = source.slice(
+      source.indexOf('async function getSession('),
+      source.indexOf('\nfunction touchSession(', source.indexOf('async function getSession(')),
+    );
+    const deleteSource = source.slice(
+      source.indexOf("app.delete('/sessions/:userId'"),
+      source.indexOf("app.get('/sessions/:userId/diagnostics'"),
+    );
+    const shutdownSource = source.slice(
+      source.indexOf('async function gracefulShutdown('),
+      source.indexOf("process.on('SIGTERM'"),
+    );
+
+    expect(getSessionSource).toContain('sessionCreationGenerations.begin(key)');
+    expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
+    expect(deleteSource).toContain('sessionCreationGenerations.invalidate(userId)');
+    expect(deleteSource).toContain('sessionCreations.get(userId)');
+    expect(shutdownSource).toContain('sessionCreationGenerations.invalidateAll()');
+    expect(shutdownSource).toContain('Array.from(sessionCreations.values())');
+  });
+
   test('coalesces concurrent teardown calls for the same session', async () => {
     let release;
     const gate = new Promise((resolve) => { release = resolve; });

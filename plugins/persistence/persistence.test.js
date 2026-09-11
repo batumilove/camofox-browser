@@ -1,3 +1,4 @@
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -132,5 +133,37 @@ describe('profile persistence helpers', () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  test('syncs temporary files before publication and the directory after renames', async () => {
+    const events = [];
+    const context = {
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [], origins: [] }));
+        events.push(`write:${path.basename(targetPath).split('.tmp-')[0]}`);
+      }),
+    };
+
+    const result = await persistStorageState({
+      profileDir: tmpDir,
+      userId: 'durable-user',
+      context,
+      syncFile: (targetPath) => events.push(`sync-file:${path.basename(targetPath).split('.tmp-')[0]}`),
+      publishFile: (sourcePath, targetPath) => {
+        events.push(`publish:${path.basename(targetPath)}`);
+        fsSync.renameSync(sourcePath, targetPath);
+      },
+      syncDirectory: (targetPath) => events.push(`sync-dir:${path.basename(targetPath)}`),
+    });
+
+    expect(result.persisted).toBe(true);
+    expect(events).toEqual([
+      'write:storage-state.json',
+      'sync-file:storage-state.json',
+      'sync-file:meta.json',
+      'publish:storage-state.json',
+      'publish:meta.json',
+      `sync-dir:${path.basename(result.userDir)}`,
+    ]);
   });
 });

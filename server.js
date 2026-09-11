@@ -42,6 +42,7 @@ import { collectUserDiagnostics } from './lib/user-diagnostics.js';
 import {
   TabAdmissionController,
   TabCapacityReservations,
+  SessionCreationGenerations,
   canReapEmptySession,
   closePageWithin,
   coalesceSessionClose,
@@ -580,6 +581,7 @@ const tabAdmission = new TabAdmissionController({
   maxActive: TAB_ADMISSION_MAX_ACTIVE,
   maxActivePerUser: TAB_ADMISSION_MAX_ACTIVE_PER_USER,
   maxPending: TAB_ADMISSION_QUEUE_LIMIT,
+  maxAbandoned: TAB_ADMISSION_MAX_ACTIVE,
   waitTimeoutMs: requestTimeoutMs(),
   operationTimeoutMs: requestTimeoutMs(),
   retryAfterSeconds: 2,
@@ -589,6 +591,12 @@ const tabAdmission = new TabAdmissionController({
   },
   onRejected: () => tabAdmissionRejectedTotal.inc(),
   onTimeout: () => tabAdmissionTimeoutsTotal.inc(),
+  onAbandonedLimit: ({ abandoned }) => {
+    log('error', 'tab admission abandoned-operation limit reached; resetting browser generation', { abandoned });
+    void closeBrowserFully('tab_admission_abandoned_limit').catch((error) => {
+      log('error', 'browser generation reset after abandoned operations failed', { error: error.message });
+    });
+  },
 });
 
 async function withTabAdmission(userId, operation) {
@@ -1223,6 +1231,7 @@ function normalizeUserId(userId) {
 }
 
 const sessionCreations = new Map();
+const sessionCreationGenerations = new SessionCreationGenerations();
 
 function clearSessionLocks(session) {
   if (!session?.tabGroups) return;
@@ -1335,6 +1344,11 @@ async function getSession(userId, { trace = false } = {}) {
   
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
+      const creationToken = sessionCreationGenerations.begin(key);
+      try {
+      if (shuttingDown) {
+        throw Object.assign(new Error('Server is shutting down'), { statusCode: 503, code: 'shutting_down' });
+      }
       if (sessions.size >= MAX_SESSIONS) {
         throw Object.assign(
           new Error('Maximum concurrent sessions reached'),
@@ -1382,6 +1396,22 @@ async function getSession(userId, { trace = false } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
+      const requirePublishable = async () => {
+        if (sessionCreationGenerations.canPublish(creationToken)) return;
+        const closeResult = await settleWithin(context.close(), 2000);
+        if (closeResult.status !== 'fulfilled') {
+          log('warn', 'invalidated session creation context cleanup did not complete', {
+            userId: key,
+            status: closeResult.status,
+            ...(closeResult.reason ? { error: closeResult.reason?.message || String(closeResult.reason) } : {}),
+          });
+        }
+        throw Object.assign(new Error('Session creation was invalidated'), {
+          statusCode: 409,
+          code: 'session_creation_invalidated',
+        });
+      };
+      await requirePublishable();
 
       let tracePath = null;
       if (trace) {
@@ -1396,6 +1426,8 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
 
+      await requirePublishable();
+
       const created = {
         context,
         tabGroups: new Map(),
@@ -1404,8 +1436,9 @@ async function getSession(userId, { trace = false } = {}) {
         tracePath,
         _pendingTabCreations: 0,
       };
-      sessions.set(key, created);
       await pluginEvents.emitAsync('session:created', { userId: key, context });
+      await requirePublishable();
+      sessions.set(key, created);
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
@@ -1413,6 +1446,9 @@ async function getSession(userId, { trace = false } = {}) {
         proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
       });
       return created;
+      } finally {
+        sessionCreationGenerations.finish(creationToken);
+      }
     });
   }
   session.lastAccess = Date.now();
@@ -5148,6 +5184,9 @@ app.delete('/sessions/:userId/traces/:filename', authMiddleware(), async (req, r
 app.delete('/sessions/:userId', authMiddleware(), async (req, res) => {
   try {
     const userId = normalizeUserId(req.params.userId);
+    sessionCreationGenerations.invalidate(userId);
+    const creation = sessionCreations.get(userId);
+    if (creation) await settleWithin(creation, 2000);
     const session = sessions.get(userId);
     if (session) {
       await closeSession(userId, session, { reason: 'api_delete_session', clearDownloads: true, clearLocks: true });
@@ -6311,6 +6350,7 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  sessionCreationGenerations.invalidateAll();
   log('info', 'shutting down', { signal });
 
   const forceTimeout = setTimeout(() => {
@@ -6321,6 +6361,10 @@ async function gracefulShutdown(signal) {
 
   server.close();
   stopMemoryReporter();
+
+  await settleAllConcurrently(Array.from(sessionCreations.values()), (creation) => (
+    settleWithin(creation, 2000)
+  ));
 
   await settleWithin(
     pluginEvents.emitAsyncSettled('server:shutdown', { signal }, (err) => {

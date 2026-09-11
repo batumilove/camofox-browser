@@ -20,6 +20,50 @@ async function flush() {
 }
 
 describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
+  test('bounds permanently abandoned operations until browser recovery settles them', async () => {
+    jest.useFakeTimers();
+    try {
+      const onAbandonedLimit = jest.fn();
+      const controller = new TabAdmissionController({
+        maxActive: 1,
+        maxActivePerUser: 1,
+        maxPending: 2,
+        maxAbandoned: 1,
+        operationTimeoutMs: 50,
+        onAbandonedLimit,
+      });
+      const hung = deferred();
+      const started = [];
+      const first = controller.run('wedged-user', () => {
+        started.push('first');
+        return hung.promise;
+      });
+      const firstRejection = expect(first).rejects.toMatchObject({
+        code: 'tab_admission_operation_timeout',
+      });
+      await flush();
+      await jest.advanceTimersByTimeAsync(50);
+      await firstRejection;
+
+      const second = controller.run('recovery-user', async () => {
+        started.push('second');
+        return 'recovered';
+      });
+      await flush();
+      expect(started).toEqual(['first']);
+      expect(controller.snapshot()).toMatchObject({ abandoned: 1 });
+      expect(onAbandonedLimit).toHaveBeenCalledTimes(1);
+
+      hung.reject(new Error('browser generation closed'));
+      await flush();
+      await expect(second).resolves.toBe('recovered');
+      expect(started).toEqual(['first', 'second']);
+      expect(controller.snapshot()).toMatchObject({ abandoned: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('operation timeout releases admission capacity even when the aborted operation never settles', async () => {
     jest.useFakeTimers();
     try {
