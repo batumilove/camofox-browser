@@ -62,6 +62,8 @@ import {
 import { TabAdmissionController, TabAdmissionError, createTabAdmissionShutdownError } from './lib/tab-admission.js';
 import { createSessionCloseCoordinator } from './lib/session-close.js';
 import { CapacityReservations } from './lib/capacity-reservations.js';
+import { BrowserStopCoordinator } from './lib/browser-stop-coordinator.js';
+import { runBoundedShutdownPhases } from './lib/shutdown-budget.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
   isDeadContextError, isPageCrashedError, isTimeoutError,
@@ -724,6 +726,18 @@ let browserIdleTimer = null;
 let browserLaunchPromise = null;
 let browserLaunchGeneration = 0;
 let browserWarmRetryTimer = null;
+const browserStopCoordinator = new BrowserStopCoordinator();
+
+function browserStoppingError() {
+  return new TabAdmissionError(
+    'Browser is stopping — retry shortly',
+    { code: 'browser_stopping', retryAfter: CONFIG.tabAdmissionRetryAfter, statusCode: 503 },
+  );
+}
+
+function assertBrowserLaunchAllowed() {
+  browserStopCoordinator.assertLaunchAllowed(browserStoppingError);
+}
 
 function invalidateBrowserLaunch() {
   browserLaunchGeneration += 1;
@@ -905,10 +919,10 @@ async function reserveTabCreation(userId, session, reqId) {
     release = capacityReservations.reserveTab(key, getSessionTabCount(session), getTotalTabCount());
   }
   if (!release) {
-    throw Object.assign(new Error('Maximum tabs per session reached'), {
-      statusCode: 429,
-      code: 'tab_capacity_reached',
-    });
+    throw new TabAdmissionError(
+      'Maximum tabs per session reached',
+      { code: 'tab_capacity_reached', retryAfter: CONFIG.tabAdmissionRetryAfter },
+    );
   }
   return release;
 }
@@ -1184,6 +1198,7 @@ async function launchBrowserInstance(launchGeneration) {
   const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    assertBrowserLaunchAllowed();
     if (tabAdmission.closed || launchGeneration !== browserLaunchGeneration) {
       throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
     }
@@ -1299,6 +1314,7 @@ async function launchBrowserInstance(launchGeneration) {
       // A launch that outlives its admitted request (for example after the
       // outer launch timeout) must not publish a fresh browser during shutdown.
       // The catch path below closes the candidate and kills its captured tree.
+      assertBrowserLaunchAllowed();
       if (tabAdmission.closed || launchGeneration !== browserLaunchGeneration) {
         throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
       }
@@ -1343,10 +1359,12 @@ async function launchBrowserInstance(launchGeneration) {
 }
 
 async function ensureBrowser() {
+  assertBrowserLaunchAllowed();
   clearBrowserIdleTimer();
   if (_browserClosePromise) {
     await _browserClosePromise;
   }
+  assertBrowserLaunchAllowed();
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
@@ -1424,6 +1442,7 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
+  let contextClosed = false;
   try {
     await sessionCloseCoordinator.close(session, {
     emitDestroying: () => pluginEvents.emitAsync('session:destroying', {
@@ -1441,7 +1460,7 @@ async function closeSession(userId, session, {
           log('warn', 'tracing.stop failed', { userId: key, error: err.message });
         }
       }
-      await session.context.close().catch(() => {});
+      await session.context.close();
     },
     emitDestroyed: () => pluginEvents.emitAsync('session:destroyed', {
       userId: key,
@@ -1456,8 +1475,11 @@ async function closeSession(userId, session, {
       userId: key, error: err.message,
     }),
     });
+    contextClosed = true;
   } finally {
-    if (sessions.get(key) === session) sessions.delete(key);
+    // A rejected close may leave a live context. Keep its closing tombstone
+    // capacity-visible rather than admitting a hidden replacement.
+    if (contextClosed && sessions.get(key) === session) sessions.delete(key);
     refreshActiveTabsGauge();
   }
 }
@@ -1470,6 +1492,7 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
 }
 
 async function getSession(userId, { trace = false } = {}) {
+  assertBrowserLaunchAllowed();
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
   
@@ -1525,6 +1548,7 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
       const b = await ensureBrowser();
+      const creationGeneration = browserLaunchGeneration;
       const contextOptions = {
         viewport: null,
         permissions: ['geolocation'],
@@ -1548,6 +1572,10 @@ async function getSession(userId, { trace = false } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
+      if (browserStopCoordinator.isStopping() || creationGeneration !== browserLaunchGeneration) {
+        await context.close().catch(() => {});
+        throw browserStoppingError();
+      }
 
       let tracePath = null;
       if (trace) {
@@ -3479,14 +3507,28 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
 
         const prewarmGoogleHome = async () => {
           if (!isGoogleSearch || tabState.visitedUrls.has('https://www.google.com/')) return;
-          const prewarm = await createLeasedPage(session);
-          const prewarmPage = prewarm.page;
+          const releaseReservation = capacityReservations.reserveTab(
+            userId,
+            getSessionTabCount(session),
+            getTotalTabCount(),
+          );
+          if (!releaseReservation) {
+            log('info', 'google prewarm skipped at tab capacity', { userId, tabId });
+            return;
+          }
+          let prewarm;
           try {
+            prewarm = await createLeasedPage(session);
+            const prewarmPage = prewarm.page;
             await withPageLoadDuration('navigate', () => navigatePage(prewarmPage, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
             tabState.visitedUrls.add('https://www.google.com/');
             await prewarmPage.waitForTimeout(1200);
           } finally {
-            await closeLeasedPage(session, prewarmPage, prewarm.lease);
+            try {
+              if (prewarm) await closeLeasedPage(session, prewarm.page, prewarm.lease);
+            } finally {
+              releaseReservation();
+            }
           }
         };
 
@@ -6646,12 +6688,14 @@ app.post('/stop', async (req, res) => {
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    const invalidatedLaunch = invalidateBrowserLaunch();
-    await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
-    await invalidatedLaunch?.catch((err) => {
-      log('info', 'invalidated browser launch settled during admin stop', { error: err.message });
+    await browserStopCoordinator.run(async () => {
+      const invalidatedLaunch = invalidateBrowserLaunch();
+      await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
+      await invalidatedLaunch?.catch((err) => {
+        log('info', 'invalidated browser launch settled during admin stop', { error: err.message });
+      });
+      await closeBrowserFully('admin_stop');
     });
-    await closeBrowserFully('admin_stop');
     res.json({ ok: true, stopped: true, profile: 'camoufox' });
   } catch (err) {
     res.status(500).json({ ok: false, error: safeError(err) });
@@ -7187,6 +7231,19 @@ setInterval(async () => {
     log('warn', 'health probe forced despite active ops', { activeOps: healthState.activeOps, timeSinceSuccessMs: timeSinceSuccess });
   }
   
+  const probeKey = '__internal_health_probe__';
+  const releaseSessionReservation = capacityReservations.reserveSession(probeKey, sessions.size);
+  if (!releaseSessionReservation) {
+    log('info', 'health probe skipped at session capacity');
+    return;
+  }
+  const releaseTabReservation = capacityReservations.reserveTab(probeKey, 0, getTotalTabCount());
+  if (!releaseTabReservation) {
+    releaseSessionReservation();
+    log('info', 'health probe skipped at tab capacity');
+    return;
+  }
+
   let testContext;
   try {
     testContext = await browser.newContext({ viewport: null });
@@ -7200,6 +7257,9 @@ setInterval(async () => {
     log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
     if (testContext) await testContext.close().catch(() => {});
     restartBrowser('health probe failed').catch(() => {});
+  } finally {
+    releaseTabReservation();
+    releaseSessionReservation();
   }
 }, 60_000);
 
@@ -7246,18 +7306,23 @@ async function gracefulShutdown(signal) {
   });
   stopMemoryReporter();
 
-  // Let already-admitted POST /tabs operations and all other in-flight HTTP
-  // handlers finish before lifecycle hooks snapshot and close session state.
-  await Promise.all([
-    serverClosed,
-    tabAdmission.waitForSettled(),
-    invalidatedLaunch?.catch((err) => {
-      log('info', 'invalidated browser launch settled during shutdown', { error: err.message });
+  // Reserve a checkpoint phase inside the 10-second watchdog. Draining can
+  // legitimately outlive that deadline (tab operations and launches each have
+  // longer budgets), so checkpointing must begin after a bounded settle phase.
+  await runBoundedShutdownPhases({
+    settle: () => Promise.all([
+      serverClosed,
+      tabAdmission.waitForSettled(),
+      invalidatedLaunch?.catch((err) => {
+        log('info', 'invalidated browser launch settled during shutdown', { error: err.message });
+      }),
+    ]),
+    checkpoint: () => pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
+      log('error', 'server:shutdown listener failed', { error: err.message });
     }),
-  ]);
-
-  await pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
-    log('error', 'server:shutdown listener failed', { error: err.message });
+    settleBudgetMs: 2500,
+    checkpointBudgetMs: 5500,
+    onPhaseTimeout: phase => log('warn', 'shutdown phase budget exhausted', { phase }),
   });
 
   await closeAllSessions(`shutdown:${signal}`, {

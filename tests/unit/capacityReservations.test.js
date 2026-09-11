@@ -55,5 +55,8 @@ describe('capacity reservations', () => {
     expect(source).toMatch(/withTabLock\(req\.params\.tabId, \(\) => rotateGoogleTab\(/);
     expect(source).not.toMatch(/async function destroySession[\s\S]*?sessions\.delete\(key\)[\s\S]*?closeSession\(/);
     expect(source).toMatch(/if \(session\._closing\)[\s\S]*?code: 'session_closing'/);
+    expect(source).toMatch(/const prewarmGoogleHome[\s\S]*?capacityReservations\.reserveTab/);
+    expect(source).toMatch(/health probe[\s\S]*?capacityReservations\.reserveSession[\s\S]*?capacityReservations\.reserveTab/);
+    expect(source).toMatch(/throw new TabAdmissionError\(\s*'Maximum tabs per session reached'/);
   });
 });

@@ -44,11 +44,19 @@ describe('session close coordination', () => {
     expect(onDestroyedError).toHaveBeenCalledWith(expect.objectContaining({ message: 'plugin failed' }));
   });
 
+  test('context close failures remain observable to the registry owner', async () => {
+    const coordinator = createSessionCloseCoordinator();
+    const session = { context: { close: jest.fn(async () => { throw new Error('still alive'); }) } };
+
+    await expect(coordinator.close(session)).rejects.toThrow('still alive');
+  });
+
   test('server delegates closeSession teardown to the coordinator', () => {
+    const closeSession = serverSrc.match(/async function closeSession[\s\S]*?\n}\n/)?.[0] ?? '';
     expect(serverSrc).toContain("from './lib/session-close.js'");
     expect(serverSrc).toMatch(/sessionCloseCoordinator\.close\(/);
-    expect(serverSrc).toMatch(/try \{\s*await sessionCloseCoordinator\.close[\s\S]*?finally \{[\s\S]*?sessions\.delete\(key\)/);
-    const closeSession = serverSrc.match(/async function closeSession[\s\S]*?\n}\n/)?.[0] ?? '';
+    expect(serverSrc).toMatch(/let contextClosed = false[\s\S]*?await sessionCloseCoordinator\.close[\s\S]*?contextClosed = true[\s\S]*?if \(contextClosed && sessions\.get\(key\) === session\)/);
+    expect(closeSession).not.toContain('session.context.close().catch');
     const closingIndex = closeSession.indexOf('session._closing = true');
     const cleanupAwaitIndex = closeSession.indexOf('await clearSessionDownloads');
     expect(closingIndex).toBeGreaterThanOrEqual(0);

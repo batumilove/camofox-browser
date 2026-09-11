@@ -209,6 +209,8 @@ test('server uses generation-safe signaling for browser and virtual-display clea
   expect(source).toMatch(/if \(tabAdmission\.closed \|\| launchGeneration !== browserLaunchGeneration\)[\s\S]*?virtualDisplay = localVirtualDisplay/);
   expect(source).toMatch(/const tracked = launch\.finally[\s\S]*?browserLaunchPromise = tracked/);
   expect(source).toMatch(/return Promise\.race\(\[\s*browserLaunchPromise,[\s\S]*?Browser launch timeout/);
-  expect(source).toMatch(/app\.post\('\/stop'[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?await invalidatedLaunch\?\.catch[\s\S]*?closeBrowserFully\('admin_stop'\)/);
+  expect(source).toMatch(/app\.post\('\/stop'[\s\S]*?browserStopCoordinator\.run[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?await invalidatedLaunch\?\.catch[\s\S]*?closeBrowserFully\('admin_stop'\)/);
+  expect(source).toMatch(/async function ensureBrowser[\s\S]*?assertBrowserLaunchAllowed\(\)/);
+  expect(source).toMatch(/async function getSession[\s\S]*?const creationGeneration = browserLaunchGeneration[\s\S]*?creationGeneration !== browserLaunchGeneration[\s\S]*?context\.close\(\)/);
   expect(source).toMatch(/tabAdmission\.shutdown\(\);[\s\S]*?const invalidatedLaunch = invalidateBrowserLaunch\(\)[\s\S]*?Promise\.all\(\[[\s\S]*?invalidatedLaunch\?\.catch/);
 });
