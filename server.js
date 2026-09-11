@@ -1448,6 +1448,16 @@ async function getSession(userId, { trace = false, signal = null } = {}) {
         }
         return contextCleanup;
       };
+      const awaitInvalidatedContextCleanup = async () => {
+        try {
+          await closeInvalidatedContext();
+        } catch (error) {
+          log('warn', 'invalidated in-flight session context cleanup failed', {
+            userId: key,
+            error: error?.message || String(error),
+          });
+        }
+      };
       const observeInvalidatedContextCleanup = () => settleWithin(closeInvalidatedContext(), 2000);
       sessionCreationGenerations.setInvalidationHandler(creationToken, () => {
         void observeInvalidatedContextCleanup().then((result) => {
@@ -1464,7 +1474,7 @@ async function getSession(userId, { trace = false, signal = null } = {}) {
         if (sessionCreationGenerations.canPublish(creationToken)) return;
         // Keep the admission operation abandoned until the underlying close really
         // settles; a reporting deadline must not hide a still-live context.
-        await closeInvalidatedContext();
+        await awaitInvalidatedContextCleanup();
         throw Object.assign(new Error('Session creation was invalidated'), {
           statusCode: 409,
           code: 'session_creation_invalidated',
@@ -1509,7 +1519,7 @@ async function getSession(userId, { trace = false, signal = null } = {}) {
           context,
           reason: 'session_creation_failed',
         });
-        await closeInvalidatedContext();
+        await awaitInvalidatedContextCleanup();
         throw error;
       }
       sessions.set(key, created);
@@ -1815,11 +1825,15 @@ function attachPopupHandler(page, userId, sessionKey, ownerSession) {
       return;
     }
 
+    const popupGroupKey = sessionKey || '__popups__';
+    let popupTabId = null;
+    let popupTabState = null;
+    let popupGroup = null;
     try {
-      const popupTabId = fly.makeTabId();
-      const popupTabState = createTabState(popupPage);
+      popupTabId = fly.makeTabId();
+      popupTabState = createTabState(popupPage);
       attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
-      const popupGroup = getTabGroup(ownerSession, sessionKey || '__popups__');
+      popupGroup = getTabGroup(ownerSession, popupGroupKey);
       popupGroup.set(popupTabId, popupTabState);
       ownerSession.lastAccess = Date.now();
       refreshActiveTabsGauge();
@@ -1828,6 +1842,13 @@ function attachPopupHandler(page, userId, sessionKey, ownerSession) {
       // Recursively handle popups from the popup
       attachPopupHandler(popupPage, userId, sessionKey, ownerSession);
     } catch (error) {
+      if (popupGroup?.get(popupTabId) === popupTabState) {
+        popupGroup.delete(popupTabId);
+        if (popupGroup.size === 0 && ownerSession.tabGroups.get(popupGroupKey) === popupGroup) {
+          ownerSession.tabGroups.delete(popupGroupKey);
+        }
+        refreshActiveTabsGauge();
+      }
       void safePageClose(popupPage, { retainUntilSettled: true });
       log('warn', 'popup registration failed', { userId: key, error: error.message });
     } finally {
@@ -6422,7 +6443,8 @@ let shuttingDown = false;
 function closeHttpServer() {
   return new Promise((resolve, reject) => {
     server.close((error) => {
-      if (error) reject(error);
+      if (error?.code === 'ERR_SERVER_NOT_RUNNING') resolve();
+      else if (error) reject(error);
       else resolve();
     });
   });
@@ -6441,6 +6463,7 @@ async function gracefulShutdown(signal) {
   forceTimeout.unref();
 
   const httpClosePromise = closeHttpServer();
+  void httpClosePromise.catch(() => {});
   stopMemoryReporter();
 
   // Teardown is the cancellation mechanism for raw browser work. Closing the

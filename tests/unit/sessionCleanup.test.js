@@ -15,6 +15,7 @@ import {
   SessionCreationGenerations,
   coalesceSessionClose,
   detachSessionForClose,
+  settleAllConcurrently,
 } from '../../lib/tab-admission.js';
 
 describe('session close registry detachment', () => {
@@ -81,10 +82,11 @@ describe('session close registry detachment', () => {
   test('server wires creation invalidation into delete, shutdown, and publication', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
-    const getSessionSource = source.slice(
-      source.indexOf('async function getSession('),
-      source.indexOf('\nfunction touchSession(', source.indexOf('async function getSession(')),
-    );
+    const getSessionStart = source.indexOf('async function getSession(');
+    const getSessionEnd = source.indexOf('\nfunction getTabGroup(', getSessionStart);
+    expect(getSessionStart).toBeGreaterThanOrEqual(0);
+    expect(getSessionEnd).toBeGreaterThan(getSessionStart);
+    const getSessionSource = source.slice(getSessionStart, getSessionEnd);
     const deleteSource = source.slice(
       source.indexOf("app.delete('/sessions/:userId'"),
       source.indexOf("app.get('/sessions/:userId/diagnostics'"),
@@ -130,10 +132,11 @@ describe('session close registry detachment', () => {
     expect(getSessionSource).toContain('await closeInvalidatedContext()');
     expect(getSessionSource).toContain("await closeSession(key, session, { reason: 'closing_session_replacement'");
 
-    const ensureBrowserSource = source.slice(
-      source.indexOf('async function ensureBrowser()'),
-      source.indexOf('// Helper to normalize userId', source.indexOf('async function ensureBrowser()')),
-    );
+    const ensureBrowserStart = source.indexOf('async function ensureBrowser()');
+    const ensureBrowserEnd = source.indexOf('// Helper to normalize userId', ensureBrowserStart);
+    expect(ensureBrowserStart).toBeGreaterThanOrEqual(0);
+    expect(ensureBrowserEnd).toBeGreaterThan(ensureBrowserStart);
+    const ensureBrowserSource = source.slice(ensureBrowserStart, ensureBrowserEnd);
     expect(ensureBrowserSource).toContain("code: 'shutting_down'");
     expect(ensureBrowserSource.indexOf("code: 'shutting_down'")).toBeLessThan(
       ensureBrowserSource.indexOf('browserLaunchCoordinator.ensure()'),
@@ -159,6 +162,92 @@ describe('session close registry detachment', () => {
     expect(calls).toBe(1);
     release();
     await Promise.all([first, second]);
+  });
+
+  test('starts the first coalesced teardown synchronously and converts sync throws to rejection', async () => {
+    const session = {};
+    const failure = new Error('sync teardown failure');
+    let started = false;
+
+    const closePromise = coalesceSessionClose(session, () => {
+      started = true;
+      throw failure;
+    });
+    const observedFailure = closePromise.then(() => null, error => error);
+
+    expect(started).toBe(true);
+    expect(await observedFailure).toBe(failure);
+    expect(session._closePromise).toBe(closePromise);
+  });
+
+  test('starts every concurrent teardown synchronously and settles sync throws', async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const failure = new Error('sync teardown failure');
+    const started = [];
+
+    const settledPromise = settleAllConcurrently(['first', 'second'], (item) => {
+      started.push(item);
+      if (item === 'first') return gate;
+      throw failure;
+    });
+
+    expect(started).toEqual(['first', 'second']);
+    release('closed');
+    expect(await settledPromise).toEqual([
+      { status: 'fulfilled', value: 'closed' },
+      { status: 'rejected', reason: failure },
+    ]);
+  });
+
+  test('shutdown tolerates an already-stopped HTTP server and observes close rejection immediately', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+
+    const closeHttpStart = source.indexOf('function closeHttpServer()');
+    const closeHttpEnd = source.indexOf('\nasync function gracefulShutdown(', closeHttpStart);
+    expect(closeHttpStart).toBeGreaterThanOrEqual(0);
+    expect(closeHttpEnd).toBeGreaterThan(closeHttpStart);
+    const closeHttpSource = source.slice(closeHttpStart, closeHttpEnd);
+    expect(closeHttpSource).toContain("error?.code === 'ERR_SERVER_NOT_RUNNING'");
+
+    const shutdownStart = source.indexOf('async function gracefulShutdown(');
+    const shutdownEnd = source.indexOf("process.on('SIGTERM'", shutdownStart);
+    expect(shutdownStart).toBeGreaterThanOrEqual(0);
+    expect(shutdownEnd).toBeGreaterThan(shutdownStart);
+    const shutdownSource = source.slice(shutdownStart, shutdownEnd);
+    expect(shutdownSource).toContain('void httpClosePromise.catch(() => {})');
+  });
+
+  test('invalidated session creation preserves its classified 409 after cleanup failure', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const getSessionStart = source.indexOf('async function getSession(');
+    const getSessionEnd = source.indexOf('\nfunction getTabGroup(', getSessionStart);
+    expect(getSessionStart).toBeGreaterThanOrEqual(0);
+    expect(getSessionEnd).toBeGreaterThan(getSessionStart);
+    const getSessionSource = source.slice(getSessionStart, getSessionEnd);
+
+    expect(getSessionSource).toContain('const awaitInvalidatedContextCleanup = async () => {');
+    expect(getSessionSource).toContain('await awaitInvalidatedContextCleanup();');
+  });
+
+  test('popup registration failure removes only its exact published state', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const popupStart = source.indexOf('function attachPopupHandler(');
+    const popupEnd = source.indexOf('\nfunction pressureHash(', popupStart);
+    expect(popupStart).toBeGreaterThanOrEqual(0);
+    expect(popupEnd).toBeGreaterThan(popupStart);
+    const popupSource = source.slice(popupStart, popupEnd);
+
+    expect(popupSource).toContain('popupGroup?.get(popupTabId) === popupTabState');
+    expect(popupSource).toContain('popupGroup.delete(popupTabId)');
+    expect(popupSource).toContain('ownerSession.tabGroups.delete(popupGroupKey)');
+    const cleanupStart = popupSource.indexOf('if (popupGroup?.get(popupTabId) === popupTabState)');
+    expect(popupSource.indexOf('popupGroup.delete(popupTabId)', cleanupStart)).toBeLessThan(
+      popupSource.indexOf('safePageClose(popupPage, { retainUntilSettled: true })', cleanupStart),
+    );
   });
 
   test('production closeSession delegates the entire teardown to the once guard', () => {
