@@ -218,6 +218,45 @@ describe('persistence plugin', () => {
     expect(saved.cookies[0].name).toBe('newer');
   });
 
+  test('invalidated creation cannot publish a late bootstrap checkpoint', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+    await fs.mkdir(ctx.config.cookiesDir, { recursive: true });
+    await fs.writeFile(
+      path.join(ctx.config.cookiesDir, 'cookies.txt'),
+      '.example.com\tTRUE\t/\tFALSE\t2147483647\tsession\tstale\n',
+    );
+
+    let current = true;
+    let releaseImport;
+    let markImportStarted;
+    const importStarted = new Promise((resolve) => { markImportStarted = resolve; });
+    const importGate = new Promise((resolve) => { releaseImport = resolve; });
+    const context = {
+      addCookies: jest.fn(async () => {
+        markImportStarted();
+        await importGate;
+      }),
+      storageState: jest.fn(async ({ path: targetPath }) => {
+        await fs.writeFile(targetPath, JSON.stringify({ cookies: [{ name: 'stale' }], origins: [] }));
+      }),
+    };
+
+    const creating = events.emitAsync('session:created', {
+      userId: 'invalidated-user',
+      context,
+      isCurrent: () => current,
+    });
+    await importStarted;
+    current = false;
+    releaseImport();
+    await creating;
+
+    expect(context.storageState).not.toHaveBeenCalled();
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'invalidated-user');
+    await expect(fs.stat(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;

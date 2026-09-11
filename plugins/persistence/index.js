@@ -49,6 +49,7 @@ export async function register(app, ctx, pluginConfig = {}) {
   // Track active sessions for checkpoint on close
   const activeSessions = new Map(); // userId -> context
   const checkpointSequences = new Map(); // userId -> latest requested checkpoint generation
+  const creationValidity = new WeakMap(); // context -> core creation-generation predicate
 
   function advanceCheckpointSequence(userId) {
     const sequence = (checkpointSequences.get(userId) || 0) + 1;
@@ -68,7 +69,8 @@ export async function register(app, ctx, pluginConfig = {}) {
       context,
       logger,
       shouldPublish: () => (
-        activeSessions.get(userId) === context
+        (creationValidity.get(context)?.() ?? true)
+        && activeSessions.get(userId) === context
         && checkpointSequences.get(userId) === sequence
       ),
     });
@@ -91,19 +93,30 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // After session is created: import bootstrap cookies if no persisted state,
   // and track the context for later checkpointing
-  events.on('session:created', async ({ userId, context }) => {
+  events.on('session:created', async ({ userId, context, isCurrent = () => true }) => {
+    if (!isCurrent()) return;
     // Invalidate any late checkpoint from the previous session generation.
     advanceCheckpointSequence(userId);
     activeSessions.set(userId, context);
+    creationValidity.set(context, isCurrent);
+    const stopIfInvalidated = () => {
+      if (isCurrent()) return false;
+      advanceCheckpointSequence(userId);
+      if (activeSessions.get(userId) === context) activeSessions.delete(userId);
+      creationValidity.delete(context);
+      return true;
+    };
 
     // If no persisted state was restored, try bootstrap cookies
     const existingState = await loadPersistedStorageState(profileDir, userId, logger);
+    if (stopIfInvalidated()) return;
     if (!existingState) {
       const result = await importBootstrapCookies({
         cookiesDir: config.cookiesDir,
         context,
         logger,
       });
+      if (stopIfInvalidated()) return;
       if (result.imported > 0) {
         log('info', 'bootstrap cookies imported', { userId, count: result.imported, source: result.source });
         await checkpoint(userId, context, 'bootstrap_cookies');
@@ -122,6 +135,7 @@ export async function register(app, ctx, pluginConfig = {}) {
     if (!context || activeSessions.get(userId) !== context) return;
     await checkpoint(userId, context, reason).catch(() => {});
     if (activeSessions.get(userId) === context) activeSessions.delete(userId);
+    creationValidity.delete(context);
   });
 
   // On session destroyed (post-close): cleanup tracking if not already done
@@ -130,6 +144,7 @@ export async function register(app, ctx, pluginConfig = {}) {
       advanceCheckpointSequence(userId);
       activeSessions.delete(userId);
     }
+    if (context) creationValidity.delete(context);
   });
 
   // Shutdown checkpoints are owned by session:destroying while contexts are alive.

@@ -38,6 +38,16 @@ describe('session close registry detachment', () => {
     expect(generations.canPublish(second)).toBe(false);
   });
 
+  test('a published creation remains current until a later global invalidation', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+
+    generations.finish(token);
+    expect(generations.canPublish(token)).toBe(true);
+    generations.invalidateAll();
+    expect(generations.canPublish(token)).toBe(false);
+  });
+
   test('server wires creation invalidation into delete, shutdown, and publication', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
@@ -56,6 +66,10 @@ describe('session close registry detachment', () => {
 
     expect(getSessionSource).toContain('sessionCreationGenerations.begin(key)');
     expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
+    expect(getSessionSource.indexOf('sessions.set(key, created)')).toBeLessThan(
+      getSessionSource.indexOf("pluginEvents.emitAsync('session:created'"),
+    );
+    expect(getSessionSource).toContain('isCurrent: () => sessionCreationGenerations.canPublish(creationToken)');
     expect(deleteSource).toContain('sessionCreationGenerations.invalidate(userId)');
     expect(deleteSource).toContain('sessionCreations.get(userId)');
     expect(shutdownSource).toContain('sessionCreationGenerations.invalidateAll()');

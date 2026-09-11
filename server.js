@@ -545,9 +545,10 @@ async function withUserLimit(userId, operation) {
   }
 }
 
-async function safePageClose(page) {
+async function safePageClose(page, { retainUntilSettled = false } = {}) {
   await closePageWithin(page, {
     timeoutMs: PAGE_CLOSE_TIMEOUT_MS,
+    retainUntilSettled,
     onFailure: (error) => log('warn', 'page close timed out or failed; cleanup abandoned', { error: error.message }),
   });
 }
@@ -1436,9 +1437,13 @@ async function getSession(userId, { trace = false } = {}) {
         tracePath,
         _pendingTabCreations: 0,
       };
-      await pluginEvents.emitAsync('session:created', { userId: key, context });
-      await requirePublishable();
       sessions.set(key, created);
+      await pluginEvents.emitAsync('session:created', {
+        userId: key,
+        context,
+        isCurrent: () => sessionCreationGenerations.canPublish(creationToken),
+      });
+      await requirePublishable();
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
@@ -2854,7 +2859,7 @@ app.post('/tabs', async (req, res) => {
               if (group?.size === 0) session.tabGroups.delete(resolvedSessionKey);
               refreshActiveTabsGauge();
             },
-            cleanup: safePageClose,
+            cleanup: (page) => safePageClose(page, { retainUntilSettled: true }),
             operation: async (page) => {
               if (url) {
                 const urlErr = validateUrl(url);

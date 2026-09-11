@@ -3,6 +3,7 @@ import {
   TabAdmissionController,
   TabCapacityReservations,
   canReapEmptySession,
+  closePageWithin,
   releaseOnAbort,
   reservePendingTabCreation,
 } from '../../lib/tab-admission.js';
@@ -20,6 +21,50 @@ async function flush() {
 }
 
 describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
+  test('keeps bounded-cleanup work abandoned until its underlying close settles', async () => {
+    jest.useFakeTimers();
+    try {
+      const closeGate = deferred();
+      const page = {
+        close: jest.fn(() => closeGate.promise),
+        isClosed: jest.fn(() => false),
+        removeAllListeners: jest.fn(),
+      };
+      const controller = new TabAdmissionController({
+        maxActive: 1,
+        maxActivePerUser: 1,
+        maxPending: 2,
+        maxAbandoned: 1,
+        operationTimeoutMs: 50,
+      });
+
+      const first = controller.run('wedged-user', () => closePageWithin(page, {
+        timeoutMs: 10,
+        retainUntilSettled: true,
+      }));
+      const firstRejection = expect(first).rejects.toMatchObject({ code: 'tab_admission_operation_timeout' });
+      await flush();
+      await jest.advanceTimersByTimeAsync(50);
+      await firstRejection;
+
+      let secondStarted = false;
+      const second = controller.run('recovery-user', async () => {
+        secondStarted = true;
+        return 'recovered';
+      });
+      await flush();
+      expect(secondStarted).toBe(false);
+      expect(controller.snapshot()).toMatchObject({ abandoned: 1 });
+
+      closeGate.resolve();
+      await flush();
+      await expect(second).resolves.toBe('recovered');
+      expect(controller.snapshot()).toMatchObject({ abandoned: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('bounds permanently abandoned operations until browser recovery settles them', async () => {
     jest.useFakeTimers();
     try {
