@@ -48,6 +48,19 @@ describe('session close registry detachment', () => {
     expect(generations.canPublish(token)).toBe(false);
   });
 
+  test('failed creation invalidates its exact token and starts attached context cleanup', () => {
+    const generations = new SessionCreationGenerations();
+    const token = generations.begin('user-1');
+    let cleanups = 0;
+    generations.setInvalidationHandler(token, () => { cleanups += 1; });
+
+    generations.invalidateToken(token);
+    generations.finish(token);
+
+    expect(generations.canPublish(token)).toBe(false);
+    expect(cleanups).toBe(1);
+  });
+
   test('server wires creation invalidation into delete, shutdown, and publication', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
@@ -66,6 +79,8 @@ describe('session close registry detachment', () => {
 
     expect(getSessionSource).toContain('sessionCreationGenerations.begin(key)');
     expect(getSessionSource).toContain('sessionCreationGenerations.canPublish(creationToken)');
+    expect(getSessionSource).toContain('sessionCreationGenerations.setInvalidationHandler(creationToken');
+    expect(getSessionSource).toContain('sessionCreationGenerations.invalidateToken(creationToken)');
     expect(getSessionSource.indexOf("pluginEvents.emitAsync('session:created'")).toBeLessThan(
       getSessionSource.indexOf('sessions.set(key, created)'),
     );

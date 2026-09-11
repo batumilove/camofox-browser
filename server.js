@@ -1397,9 +1397,27 @@ async function getSession(userId, { trace = false } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
+      let contextCleanup = null;
+      const closeInvalidatedContext = () => {
+        if (!contextCleanup) {
+          contextCleanup = settleWithin(Promise.resolve().then(() => context.close()), 2000);
+        }
+        return contextCleanup;
+      };
+      sessionCreationGenerations.setInvalidationHandler(creationToken, () => {
+        void closeInvalidatedContext().then((result) => {
+          if (result.status !== 'fulfilled') {
+            log('warn', 'invalidated in-flight session context cleanup did not complete', {
+              userId: key,
+              status: result.status,
+              ...(result.reason ? { error: result.reason?.message || String(result.reason) } : {}),
+            });
+          }
+        });
+      });
       const requirePublishable = async () => {
         if (sessionCreationGenerations.canPublish(creationToken)) return;
-        const closeResult = await settleWithin(context.close(), 2000);
+        const closeResult = await closeInvalidatedContext();
         if (closeResult.status !== 'fulfilled') {
           log('warn', 'invalidated session creation context cleanup did not complete', {
             userId: key,
@@ -1445,12 +1463,13 @@ async function getSession(userId, { trace = false } = {}) {
         });
         await requirePublishable();
       } catch (error) {
+        sessionCreationGenerations.invalidateToken(creationToken);
         await pluginEvents.emitAsyncSettled('session:destroyed', {
           userId: key,
           context,
           reason: 'session_creation_failed',
         });
-        await settleWithin(context.close(), 2000);
+        await closeInvalidatedContext();
         throw error;
       }
       sessions.set(key, created);
@@ -1878,7 +1897,7 @@ async function camofoxPressureCleanup(options = {}) {
       for (const [listItemId, group] of Array.from(session.tabGroups.entries())) {
         if (group.size === 0) session.tabGroups.delete(listItemId);
       }
-      if (closeEmptySessions && session.tabGroups.size === 0) {
+      if (closeEmptySessions && canReapEmptySession(session)) {
         session._closing = true;
         await closeSession(userId, session, { reason: 'pressure_cleanup_empty_session', clearDownloads: true, clearLocks: true });
         sessionsExpiredTotal.inc();

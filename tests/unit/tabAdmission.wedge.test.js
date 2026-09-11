@@ -24,6 +24,17 @@ async function flush() {
 }
 
 describe('wedged-cleanup slot leakage (2026-09-09/10 incidents)', () => {
+  test('pressure cleanup preserves empty sessions with pending tab creations', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
+    const pressureSource = source.slice(
+      source.indexOf('async function camofoxPressureCleanup('),
+      source.indexOf('\nasync function isGoogleUnavailable('),
+    );
+
+    expect(pressureSource).toContain('closeEmptySessions && canReapEmptySession(session)');
+  });
+
   test('legacy /tabs/open delegates to the admission-protected create handler', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '../../server.js'), 'utf8');
