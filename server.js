@@ -2078,10 +2078,11 @@ function attachPopupHandler(page, userId, sessionKey) {
     }
 
     // The popup already exists in context.pages(), so subtract it from the
-    // observed global count while reserving the slot that will track it.
+    // observed counts (both global and per-session) while reserving the slot
+    // that will track it.
     const releaseReservation = capacityReservations.reserveTab(
       key,
-      getSessionTabCount(currentSession),
+      Math.max(0, getSessionTabCount(currentSession) - 1),
       Math.max(0, getTotalTabCount() - 1),
     );
     if (!releaseReservation) {
@@ -6655,8 +6656,16 @@ app.post('/tabs/open', async (req, res) => {
     const urlErr = validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
 
-    const result = await tabAdmission.run(userId, async () => {
+    const result = await tabAdmission.run(userId, async ({ signal: admissionSignal }) => {
+      const assertAdmissionCurrent = () => {
+        if (admissionSignal?.aborted) throw admissionSignal.reason || new TabAdmissionError(
+          'Tab creation operation timed out',
+          { code: 'tab_admission_operation_timeout', retryAfter: CONFIG.tabAdmissionRetryAfter },
+        );
+        if (tabAdmission.closed) throw createTabAdmissionShutdownError(CONFIG.tabAdmissionRetryAfter);
+      };
       let session = await getSession(userId);
+      assertAdmissionCurrent();
       const releaseTabReservation = await reserveTabCreation(userId, session, req.reqId);
       let group = getTabGroup(session, listItemId);
       let page;
@@ -6664,6 +6673,7 @@ app.post('/tabs/open', async (req, res) => {
       const tabId = fly.makeTabId();
       try {
         const created = await createLeasedPage(session);
+        assertAdmissionCurrent();
         page = created.page;
         tabState = createTabState(page);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -6674,7 +6684,7 @@ app.post('/tabs/open', async (req, res) => {
       }
     attachPopupHandler(page, userId, listItemId);
     refreshActiveTabsGauge();
-    
+
     try {
       await withPageLoadDuration('open_url', () => navigatePage(page, url));
       recordNavSuccess(userId);
@@ -6689,11 +6699,13 @@ app.post('/tabs/open', async (req, res) => {
         if (oldSession) {
           await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
         }
+        assertAdmissionCurrent();
         session = await getSession(userId);
         group = getTabGroup(session, listItemId);
         const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
         try {
           const retryCreated = await createLeasedPage(session);
+          assertAdmissionCurrent();
           page = retryCreated.page;
           tabState = createTabState(page);
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
