@@ -9,6 +9,7 @@ const intentionalStopReasons = new Set(['idle_shutdown', 'admin_stop']);
 function suppress(overrides = {}) {
   return shouldSuppressBrowserWarmRetry({
     isStopping: false,
+    shuttingDown: false,
     retryGeneration: 7,
     currentGeneration: 7,
     lastStopReason: null,
@@ -20,6 +21,10 @@ function suppress(overrides = {}) {
 describe('browser warm retry suppression', () => {
   test('blocks scheduling while an admin stop is still settling', () => {
     expect(suppress({ isStopping: true })).toBe(true);
+  });
+
+  test('blocks scheduling after graceful shutdown begins', () => {
+    expect(suppress({ shuttingDown: true })).toBe(true);
   });
 
   test('blocks a startup failure retry after a no-browser admin stop settles', () => {

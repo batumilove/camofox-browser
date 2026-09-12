@@ -17,6 +17,32 @@ const deferred = () => {
 };
 
 describe('POST /tabs admission recovery', () => {
+  test('operation timeout aborts the admitted operation before late publication', async () => {
+    const raw = deferred();
+    let operationSignal;
+    const admission = new TabAdmissionController({
+      maxActive: 1,
+      maxActivePerUser: 1,
+      maxAbandoned: 1,
+      waitTimeoutMs: 10,
+      operationTimeoutMs: 10,
+    });
+
+    const operation = admission.run('user-a', async ({ signal }) => {
+      operationSignal = signal;
+      await raw.promise;
+      if (signal.aborted) return 'discarded';
+      return 'published';
+    });
+
+    await expect(operation).rejects.toMatchObject({ code: 'tab_admission_operation_timeout' });
+    expect(operationSignal).toBeInstanceOf(AbortSignal);
+    expect(operationSignal.aborted).toBe(true);
+    raw.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(admission.snapshot()).toMatchObject({ active: 0, abandoned: 0 });
+  });
+
   test('timed-out raw creations stay bounded across retries', async () => {
     const raw = deferred();
     const create = jest.fn(() => raw.promise);
@@ -123,6 +149,15 @@ describe('POST /tabs admission recovery', () => {
     expect(serverSrc).toContain("from './lib/tab-admission.js'");
     expect(serverSrc).toMatch(/app\.post\('\/tabs'[\s\S]*tabAdmission\.run\(/);
     expect(serverSrc).toMatch(/TabAdmissionError[\s\S]*Retry-After/);
+  });
+
+  test('POST /tabs validates before creation and publishes only after abort-safe navigation', () => {
+    const route = serverSrc.match(/app\.post\('\/tabs'[\s\S]*?\n}\);/)?.[0] ?? '';
+    expect(route).toContain('async ({ signal: admissionSignal }) =>');
+    expect(route.indexOf('validateUrl(url)')).toBeLessThan(route.indexOf('createPageWithRecoveryForUser'));
+    expect(route.indexOf('navigatePage(page, url)')).toBeLessThan(route.indexOf('group.set(tabId, tabState)'));
+    expect(route).toMatch(/assertAdmissionCurrent\(admissionSignal\)[\s\S]*group\.set\(tabId, tabState\)/);
+    expect(route).toMatch(/catch \(creationError\)[\s\S]*closeLeasedPage\(session, page, pageLease\)/);
   });
 
   test('legacy POST /tabs/open cannot bypass admission or error serialization', () => {

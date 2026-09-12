@@ -245,20 +245,21 @@ export async function register(app, ctx, pluginConfig = {}) {
     await checkpoint(userId, context, 'storage_export', storageState);
   });
 
-  // On session destroying (pre-close): checkpoint while context is still alive
+  // On session destroying (pre-close): checkpoint while context is still alive.
+  // Teardown without the exact context identity is ambiguous and must not touch
+  // a possibly newer replacement session.
   events.on('session:destroying', async ({ userId, context: eventContext, reason }) => {
     const trackedContext = activeSessions.get(userId);
-    const context = eventContext || trackedContext;
-    if (!context || trackedContext !== context) return;
+    if (!eventContext || trackedContext !== eventContext) return;
     if (reason !== 'storage_reset') {
-      await checkpoint(userId, context, reason).catch(() => {});
+      await checkpoint(userId, eventContext, reason).catch(() => {});
     }
-    if (activeSessions.get(userId) === context) activeSessions.delete(userId);
+    if (activeSessions.get(userId) === eventContext) activeSessions.delete(userId);
   });
 
-  // On session destroyed (post-close): cleanup tracking if not already done
+  // On session destroyed (post-close): cleanup only the exact tracked context.
   events.on('session:destroyed', async ({ userId, context }) => {
-    if (!context || activeSessions.get(userId) === context) activeSessions.delete(userId);
+    if (context && activeSessions.get(userId) === context) activeSessions.delete(userId);
   });
 
   // On shutdown: checkpoint all remaining sessions
