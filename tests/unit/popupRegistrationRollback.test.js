@@ -104,15 +104,21 @@ describe('popup registration rollback', () => {
     const finallyBody = popupHandler.slice(outerFinally[0], outerFinally[1]);
     const releases = [...finallyBody.matchAll(/releaseReservation\(\)/g)];
     expect(releases.length).toBe(1);
-    // exactly one release in the ENTIRE post-rejection handler region
+    // exactly one release in the ENTIRE post-rejection handler region, by
+    // any invocation form (direct, .call, .apply, aliasing is excluded by
+    // requiring the identifier to appear exactly twice: declaration + call)
     const postReject = popupHandler.slice(rejectIdx + 'if (!releaseReservation)'.length);
-    const allReleases = [...postReject.matchAll(/releaseReservation\(\)/g)];
+    const allReleases = [...postReject.matchAll(/releaseReservation\b/g)];
     expect(allReleases.length).toBe(1);
 
     // Inner catch guards the post-publication body.
     const innerTry = blockRange(popupHandler, 'try', setRange[1]);
     expect(innerTry).not.toBeNull();
     expect(innerTry[0]).toBeGreaterThan(setRange[0]);
+    // the inner try must be the ONLY text after the publication statement
+    // (nothing throwable may run between popupGroup.set and the guarded try)
+    const postSetGap = popupHandler.slice(setRange[1], innerTry[0]);
+    expect(postSetGap.replace(/[;\s]/g, '')).toBe('');
     const innerCatch = blockRange(popupHandler, /catch \(error\) \{/g, innerTry[1] - 40);
     expect(innerCatch).not.toBeNull();
     // the inner catch keyword is the ONLY text between inner try end and catch start
@@ -120,16 +126,26 @@ describe('popup registration rollback', () => {
     expect(intervening.trim()).toBe('');
     const catchBody = popupHandler.slice(innerCatch[0], innerCatch[1]);
 
-    // Rollback completeness and ordering: delete tab, delete empty group,
-    // refresh gauge — all before the page close.
+    // Rollback completeness, strict ordering, and no conditional wrapping:
+    // delete tab, delete empty group, refresh gauge — all before page close,
+    // strictly ordered, and not nested inside any if/conditional.
     const delIdx = catchBody.indexOf('popupGroup.delete(popupTabId)');
     const emptyGroupIdx = catchBody.search(/popupGroup\.size === 0[\s\S]*?tabGroups\.delete\(popupGroupKey\)/);
     const gaugeIdx = catchBody.indexOf('refreshActiveTabsGauge()');
     const closeIdx = catchBody.indexOf('safePageClose(popupPage');
-    for (const i of [delIdx, emptyGroupIdx, gaugeIdx]) {
-      expect(i).toBeGreaterThan(-1);
-      expect(closeIdx).toBeGreaterThan(i);
-    }
+    expect(delIdx).toBeGreaterThan(-1);
+    expect(emptyGroupIdx).toBeGreaterThan(-1);
+    expect(gaugeIdx).toBeGreaterThan(-1);
+    expect(closeIdx).toBeGreaterThan(-1);
+    // strict total order of the rollback sequence
+    expect(delIdx).toBeLessThan(emptyGroupIdx);
+    expect(emptyGroupIdx).toBeLessThan(gaugeIdx);
+    expect(gaugeIdx).toBeLessThan(closeIdx);
+    // no conditional wraps any rollback statement except the intended
+    // empty-group guard; an `if (false)`-style guard would make rollback
+    // unreachable
+    const conditionals = [...catchBody.matchAll(/\bif\s*\(([^)]*)\)/g)].map((m) => m[1].trim());
+    expect(conditionals).toEqual(['popupGroup.size === 0']);
     // the emitted tab:created and the recursive attach must be INSIDE the inner try
     expect(emitRange[0]).toBeGreaterThan(innerTry[0]);
     expect(emitRange[1]).toBeLessThanOrEqual(innerTry[1]);
@@ -170,5 +186,11 @@ describe('popup registration rollback', () => {
     // the outer finally keyword directly follows the outer try block
     const following = popupHandler.slice(outerTry[1], outerTry[1] + 12);
     expect(following).toMatch(/^\s*finally \{/);
+    // and the outer finally's closing brace is the handler's last statement:
+    // nothing may follow it except the page.on callback terminator
+    const outerFinallyEnd = blockRange(popupHandler, /finally \{/g, outerTry[1]);
+    expect(outerFinallyEnd).not.toBeNull();
+    const postFinally = popupHandler.slice(outerFinallyEnd[1]).replace(/\s/g, '');
+    expect(postFinally).toBe('});}');
   });
 });
