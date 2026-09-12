@@ -137,6 +137,36 @@ describe('OpenAPI spec', () => {
     expect(createTab.requestBody.content['application/json']).toBeDefined();
   });
 
+  test('POST /tabs documents the exhaustive 429 code set', () => {
+    const response = spec.paths['/tabs']?.post?.responses?.['429'];
+    expect(response).toBeDefined();
+    const codeEnum = response.content['application/json'].schema.allOf[1].properties.code.enum;
+    expect(new Set(codeEnum)).toEqual(new Set([
+      'tab_admission_wait_saturated',
+      'tab_admission_wait_timeout',
+      'tab_admission_operation_timeout',
+      'tab_admission_abandoned_saturated',
+      'tab_capacity_reached',
+    ]));
+    expect(response.headers).toHaveProperty('Retry-After');
+  });
+
+  test('POST /tabs documents the exhaustive 503 code set', () => {
+    const response = spec.paths['/tabs']?.post?.responses?.['503'];
+    expect(response).toBeDefined();
+    const codeEnum = response.content['application/json'].schema.allOf[1].properties.code.enum;
+    expect(new Set(codeEnum)).toEqual(new Set([
+      'tab_admission_shutting_down',
+      'browser_stopping',
+      'session_closing',
+      'admission_rejected',
+      'browser_launch_timeout',
+      'session_expired',
+    ]));
+    expect(response.headers).toHaveProperty('Retry-After');
+    expect(response.headers['Retry-After'].description).toContain('admission');
+  });
+
   test('legacy routes are marked deprecated', () => {
     const legacyPaths = {
       '/act': 'post',
@@ -190,12 +220,13 @@ describe('OpenAPI spec', () => {
     expect(unresolved).toEqual([]);
   });
 
-  test('openapi.json in repo root is up to date', () => {
+  test.each(['openapi.json', join('docs', 'openapi.json')])('%s is up to date', relativePath => {
+    const absolutePath = join(__dirname, '..', '..', relativePath);
     let committed;
     try {
-      committed = JSON.parse(readFileSync(join(__dirname, '..', '..', 'openapi.json'), 'utf8'));
+      committed = JSON.parse(readFileSync(absolutePath, 'utf8'));
     } catch {
-      throw new Error('openapi.json not found -- run: npm run generate-openapi');
+      throw new Error(`${relativePath} not found -- run: npm run generate-openapi`);
     }
     expect(committed).toEqual(spec);
   });

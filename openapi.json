@@ -492,11 +492,76 @@
             }
           },
           "429": {
-            "description": "Tab limit reached.",
+            "description": "Admission was rejected because the bounded waiting queue was full (`tab_admission_wait_saturated`), timed out before start (`tab_admission_wait_timeout`), timed out while creating the tab (`tab_admission_operation_timeout`), or tab capacity remained exhausted after recycling (`tab_capacity_reached`).",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "tab_admission_wait_saturated",
+                            "tab_admission_wait_timeout",
+                            "tab_admission_operation_timeout",
+                            "tab_admission_abandoned_saturated",
+                            "tab_capacity_reached"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Admission was rejected because tab admission is shutting down (`tab_admission_shutting_down`), the browser is stopping (`browser_stopping`), the user's existing session is closing (`session_closing`), session/memory capacity rejected creation (`admission_rejected`), browser launch timed out (`browser_launch_timeout`), or the browser session expired (`session_expired`).",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; present for coordinated tab-admission and browser-stop rejections.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "tab_admission_shutting_down",
+                            "browser_stopping",
+                            "session_closing",
+                            "admission_rejected",
+                            "browser_launch_timeout",
+                            "session_expired"
+                          ]
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }
@@ -2736,6 +2801,28 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Tab admission is saturated or timed out.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Tab admission is shutting down.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
                 }
               }
             }

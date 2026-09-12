@@ -51,7 +51,7 @@ describe('launch compatibility source contract', () => {
 
   test('uses a real desktop window only when interactive desktop mode is explicit', () => {
     const launch = sourceBetween(
-      'async function launchBrowserInstance()',
+      'async function launchBrowserInstance(launchGeneration)',
       'async function ensureBrowser()'
     );
 
@@ -63,10 +63,10 @@ describe('launch compatibility source contract', () => {
   test('falls back when optional GeoIP setup is unavailable', () => {
     const geoipFallback = sourceBetween(
       'function isCamoufoxGeoipError',
-      'async function launchBrowserInstance()'
+      'async function launchBrowserInstance(launchGeneration)'
     );
     const launchBrowser = sourceBetween(
-      'async function launchBrowserInstance()',
+      'async function launchBrowserInstance(launchGeneration)',
       'async function ensureBrowser()'
     );
 
