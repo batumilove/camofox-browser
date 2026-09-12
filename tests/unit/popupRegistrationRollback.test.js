@@ -135,10 +135,18 @@ describe('popup registration rollback', () => {
     const delIdx = catchBody.indexOf('popupGroup.delete(popupTabId)');
     // anchor the empty-group step on the actual delete position, not the guard
     const emptyGroupIdx = catchBody.indexOf('tabGroups.delete(popupGroupKey)');
-    // the delete must sit INSIDE the empty-group guard's block
+    // the guard body must be EXACTLY the delete statement (no short-circuit
+    // suppression, no duplicates, no comment-only match) and the indexed
+    // occurrence must be the one inside the guard
     const guardMatch = catchBody.match(/if \(popupGroup\.size === 0\) \{([\s\S]*?)\n\s*}/);
     expect(guardMatch).not.toBeNull();
-    expect(guardMatch[1]).toContain('tabGroups.delete(popupGroupKey)');
+    expect(guardMatch[1].replace(/\s/g, '')).toBe('currentSession.tabGroups.delete(popupGroupKey);');
+    const guardStart = catchBody.indexOf(guardMatch[0]);
+    const guardInnerStart = guardStart + guardMatch[0].indexOf('{') + 1;
+    const guardInnerEnd = guardStart + guardMatch[0].lastIndexOf('}');
+    expect(emptyGroupIdx).toBeGreaterThan(guardInnerStart);
+    expect(catchBody.indexOf('tabGroups.delete(popupGroupKey)', emptyGroupIdx + 1, guardInnerEnd)).toBe(-1);
+    expect([...catchBody.matchAll(/tabGroups\.delete\(popupGroupKey\)/g)].length).toBe(1);
     const gaugeIdx = catchBody.indexOf('refreshActiveTabsGauge()');
     const closeIdx = catchBody.indexOf('safePageClose(popupPage');
     expect(delIdx).toBeGreaterThan(-1);
