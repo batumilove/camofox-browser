@@ -6673,8 +6673,13 @@ app.post('/tabs/open', async (req, res) => {
       const tabId = fly.makeTabId();
       try {
         const created = await createLeasedPage(session);
-        assertAdmissionCurrent();
         page = created.page;
+        try {
+          assertAdmissionCurrent();
+        } catch (assertErr) {
+          await closeLeasedPage(session, created.page, created.lease);
+          throw assertErr;
+        }
         tabState = createTabState(page);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
         group.set(tabId, tabState);
@@ -6701,12 +6706,18 @@ app.post('/tabs/open', async (req, res) => {
         }
         assertAdmissionCurrent();
         session = await getSession(userId);
+        assertAdmissionCurrent();
         group = getTabGroup(session, listItemId);
         const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
         try {
           const retryCreated = await createLeasedPage(session);
-          assertAdmissionCurrent();
           page = retryCreated.page;
+          try {
+            assertAdmissionCurrent();
+          } catch (assertErr) {
+            await closeLeasedPage(session, retryCreated.page, retryCreated.lease);
+            throw assertErr;
+          }
           tabState = createTabState(page);
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
