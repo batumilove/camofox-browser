@@ -7,12 +7,13 @@
 
 import { detectYtDlp, hasYtDlp, ensureYtDlp, ytDlpTranscript, parseJson3, parseVtt, parseXml } from './youtube.js';
 import { classifyError } from '../../lib/request-utils.js';
+import { reservePendingTabCreation } from '../../lib/tab-admission.js';
 
 export async function register(app, ctx, pluginConfig = {}) {
-  const { log, config, sessions, ensureBrowser, getSession,
+  const { log, config, ensureBrowser, getSession,
           withUserLimit, safePageClose, normalizeUserId,
           validateUrl, safeError, buildProxyUrl, proxyPool,
-          failuresTotal } = ctx;
+          failuresTotal, closeSession } = ctx;
 
   const NAVIGATE_TIMEOUT_MS = config.navigateTimeoutMs;
 
@@ -78,9 +79,11 @@ export async function register(app, ctx, pluginConfig = {}) {
     return await withUserLimit('__yt_transcript__', async () => {
       await ensureBrowser();
       const session = await getSession('__yt_transcript__');
-      const page = await session.context.newPage();
+      const releaseTranscriptLease = reservePendingTabCreation(session);
+      let page = null;
 
       try {
+        page = await session.context.newPage();
         await page.addInitScript(() => {
           const origPlay = HTMLMediaElement.prototype.play;
           HTMLMediaElement.prototype.play = function() { this.volume = 0; this.muted = true; return origPlay.call(this); };
@@ -184,21 +187,32 @@ export async function register(app, ctx, pluginConfig = {}) {
           available_languages: meta.languages,
         };
       } finally {
-        await safePageClose(page);
-        // Clean up transcript session if no live pages remain
+        try {
+          if (page) await safePageClose(page, { retainUntilSettled: true });
+        } finally {
+          // Keep the session non-reapable until this request's raw page-close
+          // settlement completes, then expose it to ordinary empty cleanup.
+          releaseTranscriptLease();
+        }
+        // Clean up transcript session if no live pages or sibling transcript
+        // creation/usage leases remain. Delegate to the core teardown path so
+        // detachment, capacity, raw-close tracking, and lifecycle hooks use the
+        // same ownership contract as every session.
         const ytKey = normalizeUserId('__yt_transcript__');
-        const ytSession = sessions.get(ytKey);
-        if (ytSession && !ytSession._closing) {
+        let shouldCloseSession = false;
+        if (!session._closing && (session._pendingTabCreations || 0) === 0) {
           try {
-            const remainingPages = ytSession.context.pages();
-            if (remainingPages.length === 0) {
-              ytSession._closing = true;
-              ytSession.context.close().catch(() => {});
-              sessions.delete(ytKey);
-            }
+            shouldCloseSession = session.context.pages().length === 0;
           } catch {
-            sessions.delete(ytKey);
+            shouldCloseSession = true;
           }
+        }
+        if (shouldCloseSession) {
+          await closeSession(ytKey, session, {
+            reason: 'youtube_transcript_complete',
+            clearDownloads: true,
+            clearLocks: true,
+          }).catch(() => {});
         }
       }
     });

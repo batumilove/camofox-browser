@@ -40,9 +40,13 @@ import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js'
 import { BrowserLaunchCoordinator } from './lib/browser-launch-coordinator.js';
 import { collectUserDiagnostics } from './lib/user-diagnostics.js';
 import {
+  InFlightOperations,
+  runWithRetainedLock,
+  SessionCapacityReservations,
   TabAdmissionController,
   TabCapacityReservations,
   SessionCreationGenerations,
+  claimTabForPressureCleanup,
   canReapEmptySession,
   closePageWithin,
   coalesceSessionClose,
@@ -452,6 +456,13 @@ class TabLock {
     });
   }
 
+  tryAcquire() {
+    if (this.active || this.queue.length > 0) return false;
+    this.active = true;
+    refreshTabLockQueueDepth();
+    return true;
+  }
+
   release() {
     this.active = false;
     this._tryNext();
@@ -491,20 +502,21 @@ function getTabLock(tabId) {
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS) {
   const lock = getTabLock(tabId);
   await lock.acquire(TAB_LOCK_TIMEOUT_MS);
-  try {
-    return await withTimeout(operation(), timeoutMs, 'action');
-  } finally {
-    lock.release();
-  }
+  return runWithRetainedLock(lock, operation, (rawOperation) => (
+    withTimeout(rawOperation, timeoutMs, 'action')
+  ));
 }
 
+const activeTimedOperations = new InFlightOperations();
+const activeSessionTeardownOperations = new InFlightOperations();
+
 function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    )
-  ]);
+  const operation = activeTimedOperations.track(promise);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
 }
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
@@ -1210,10 +1222,20 @@ const browserLaunchCoordinator = new BrowserLaunchCoordinator({
 });
 
 async function ensureBrowser() {
+  const rejectShutdownLaunch = () => {
+    if (shuttingDown) {
+      throw Object.assign(new Error('Server is shutting down'), {
+        statusCode: 503,
+        code: 'shutting_down',
+      });
+    }
+  };
+  rejectShutdownLaunch();
   clearBrowserIdleTimer();
   // A close uses broad survivor cleanup for the currently published browser.
   // Do not let a replacement launch appear until that cleanup is finished.
   if (_browserClosePromise) await _browserClosePromise;
+  rejectShutdownLaunch();
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
@@ -1223,6 +1245,7 @@ async function ensureBrowser() {
     await closeBrowserFully('browser_disconnected');
   }
   if (browser) return browser;
+  rejectShutdownLaunch();
   return browserLaunchCoordinator.ensure();
 }
 
@@ -1233,6 +1256,10 @@ function normalizeUserId(userId) {
 
 const sessionCreations = new Map();
 const sessionCreationGenerations = new SessionCreationGenerations();
+const sessionCapacity = new SessionCapacityReservations({
+  maxSessions: MAX_SESSIONS,
+  getPublishedCount: () => sessions.size,
+});
 
 function clearSessionLocks(session) {
   if (!session?.tabGroups) return;
@@ -1252,6 +1279,7 @@ async function closeSession(userId, session, {
   reason = 'session_closed',
   clearDownloads = true,
   clearLocks = true,
+  teardownTimeoutMs = 2000,
 } = {}) {
   if (!session) return;
 
@@ -1262,6 +1290,12 @@ async function closeSession(userId, session, {
   // _closing session resident. Identity checking protects a newer session
   // installed under the same user key from late teardown of the old one.
   detachSessionForClose(sessions, key, session);
+  let settleDetachedCapacity = null;
+  let contextClosePromise = null;
+  // Once teardown owns a session, account for its raw context until close
+  // settles even if a newer session already replaced it under the same key.
+  const detachedClose = new Promise((resolve) => { settleDetachedCapacity = resolve; });
+  sessionCapacity.trackDetached(detachedClose);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
@@ -1287,7 +1321,13 @@ async function closeSession(userId, session, {
 
   await runBoundedSessionTeardown({
     steps,
-    closeContext: () => session.context.close(),
+    closeContext: () => {
+      if (!contextClosePromise) {
+        contextClosePromise = Promise.resolve().then(() => session.context.close());
+        contextClosePromise.then(settleDetachedCapacity, settleDetachedCapacity);
+      }
+      return contextClosePromise;
+    },
     emitDestroyed: () => pluginEvents.emitAsyncSettled(
       'session:destroyed',
       payload,
@@ -1297,7 +1337,8 @@ async function closeSession(userId, session, {
         error: err?.message || String(err),
       }),
     ),
-    timeoutMs: 2000,
+    timeoutMs: teardownTimeoutMs,
+    trackOperation: (operation) => activeSessionTeardownOperations.track(operation),
     onSettlement: (name, result) => {
       if (result.status === 'fulfilled') {
         if (name === 'tracing.stop') log('info', 'tracing saved', { userId: key, path: session.tracePath });
@@ -1315,21 +1356,27 @@ async function closeSession(userId, session, {
   });
 }
 
-async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
+async function closeAllSessions(reason, {
+  clearDownloads = true,
+  clearLocks = true,
+  teardownTimeoutMs = 2000,
+} = {}) {
   const openSessions = Array.from(sessions.entries());
   await settleAllConcurrently(openSessions, ([userId, session]) => (
-    closeSession(userId, session, { reason, clearDownloads, clearLocks })
+    closeSession(userId, session, { reason, clearDownloads, clearLocks, teardownTimeoutMs })
   ));
 }
 
-async function getSession(userId, { trace = false } = {}) {
+async function getSession(userId, { trace = false, signal = null } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
   
   // Check if existing session's context is still alive
   if (session) {
     if (session._closing) {
-      // Session is being torn down by reaper/expiry -- treat as dead
+      // Ensure the old context is detached and capacity-tracked before a
+      // replacement can reserve and publish under the same user key.
+      await closeSession(key, session, { reason: 'closing_session_replacement', clearDownloads: true, clearLocks: true });
       session = null;
     } else {
       try {
@@ -1345,16 +1392,13 @@ async function getSession(userId, { trace = false } = {}) {
   
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
+      const releaseSessionCapacity = sessionCapacity.reserve();
       const creationToken = sessionCreationGenerations.begin(key);
+      const unbindCreationAbort = sessionCreationGenerations.bindAbort(creationToken, signal);
       try {
+      if (signal?.aborted) throw signal.reason;
       if (shuttingDown) {
         throw Object.assign(new Error('Server is shutting down'), { statusCode: 503, code: 'shutting_down' });
-      }
-      if (sessions.size >= MAX_SESSIONS) {
-        throw Object.assign(
-          new Error('Maximum concurrent sessions reached'),
-          { statusCode: 503, code: 'admission_rejected' }
-        );
       }
       // Memory admission control (Fly.io only) — reject new sessions when
       // system memory is critically low. 503 tells Fly Proxy to try another machine.
@@ -1400,12 +1444,23 @@ async function getSession(userId, { trace = false } = {}) {
       let contextCleanup = null;
       const closeInvalidatedContext = () => {
         if (!contextCleanup) {
-          contextCleanup = settleWithin(Promise.resolve().then(() => context.close()), 2000);
+          contextCleanup = Promise.resolve().then(() => context.close());
         }
         return contextCleanup;
       };
+      const awaitInvalidatedContextCleanup = async () => {
+        try {
+          await closeInvalidatedContext();
+        } catch (error) {
+          log('warn', 'invalidated in-flight session context cleanup failed', {
+            userId: key,
+            error: error?.message || String(error),
+          });
+        }
+      };
+      const observeInvalidatedContextCleanup = () => settleWithin(closeInvalidatedContext(), 2000);
       sessionCreationGenerations.setInvalidationHandler(creationToken, () => {
-        void closeInvalidatedContext().then((result) => {
+        void observeInvalidatedContextCleanup().then((result) => {
           if (result.status !== 'fulfilled') {
             log('warn', 'invalidated in-flight session context cleanup did not complete', {
               userId: key,
@@ -1417,14 +1472,9 @@ async function getSession(userId, { trace = false } = {}) {
       });
       const requirePublishable = async () => {
         if (sessionCreationGenerations.canPublish(creationToken)) return;
-        const closeResult = await closeInvalidatedContext();
-        if (closeResult.status !== 'fulfilled') {
-          log('warn', 'invalidated session creation context cleanup did not complete', {
-            userId: key,
-            status: closeResult.status,
-            ...(closeResult.reason ? { error: closeResult.reason?.message || String(closeResult.reason) } : {}),
-          });
-        }
+        // Keep the admission operation abandoned until the underlying close really
+        // settles; a reporting deadline must not hide a still-live context.
+        await awaitInvalidatedContextCleanup();
         throw Object.assign(new Error('Session creation was invalidated'), {
           statusCode: 409,
           code: 'session_creation_invalidated',
@@ -1469,7 +1519,7 @@ async function getSession(userId, { trace = false } = {}) {
           context,
           reason: 'session_creation_failed',
         });
-        await closeInvalidatedContext();
+        await awaitInvalidatedContextCleanup();
         throw error;
       }
       sessions.set(key, created);
@@ -1481,6 +1531,8 @@ async function getSession(userId, { trace = false } = {}) {
       });
       return created;
       } finally {
+        releaseSessionCapacity();
+        unbindCreationAbort();
         sessionCreationGenerations.finish(creationToken);
       }
     });
@@ -1698,7 +1750,6 @@ function destroySession(userId) {
   const session = sessions.get(key);
   if (!session) return;
   log('warn', 'destroying dead session', { userId: key });
-  sessions.delete(key);
   closeSession(key, session, { reason: 'destroy_session', clearDownloads: true, clearLocks: true }).catch(() => {});
 }
 
@@ -1757,23 +1808,52 @@ function createTabState(page) {
  * The handler registers the popup in the same session's '__popups__' tab group
  * and recursively attaches itself to the new page.
  */
-function attachPopupHandler(page, userId, sessionKey) {
+function attachPopupHandler(page, userId, sessionKey, ownerSession) {
   page.on('popup', (popupPage) => {
     const key = normalizeUserId(userId);
-    const currentSession = sessions.get(key);
-    if (!currentSession || currentSession._closing) return;
+    if (sessions.get(key) !== ownerSession || ownerSession._closing) {
+      void safePageClose(popupPage, { retainUntilSettled: true });
+      return;
+    }
 
-    const popupTabId = fly.makeTabId();
-    const popupTabState = createTabState(popupPage);
-    attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
-    const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
-    popupGroup.set(popupTabId, popupTabState);
-    currentSession.lastAccess = Date.now();
-    refreshActiveTabsGauge();
-    log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: popupPage.url() });
-    pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: popupPage.url() });
-    // Recursively handle popups from the popup
-    attachPopupHandler(popupPage, userId, sessionKey);
+    let releaseCapacity;
+    try {
+      releaseCapacity = tabCapacity.reserve(key);
+    } catch (error) {
+      void safePageClose(popupPage, { retainUntilSettled: true });
+      log('warn', 'popup rejected by tab capacity', { userId: key, error: error.message });
+      return;
+    }
+
+    const popupGroupKey = sessionKey || '__popups__';
+    let popupTabId = null;
+    let popupTabState = null;
+    let popupGroup = null;
+    try {
+      popupTabId = fly.makeTabId();
+      popupTabState = createTabState(popupPage);
+      attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
+      popupGroup = getTabGroup(ownerSession, popupGroupKey);
+      popupGroup.set(popupTabId, popupTabState);
+      ownerSession.lastAccess = Date.now();
+      refreshActiveTabsGauge();
+      log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: popupPage.url() });
+      pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: popupPage.url() });
+      // Recursively handle popups from the popup
+      attachPopupHandler(popupPage, userId, sessionKey, ownerSession);
+    } catch (error) {
+      if (popupGroup?.get(popupTabId) === popupTabState) {
+        popupGroup.delete(popupTabId);
+        if (popupGroup.size === 0 && ownerSession.tabGroups.get(popupGroupKey) === popupGroup) {
+          ownerSession.tabGroups.delete(popupGroupKey);
+        }
+        refreshActiveTabsGauge();
+      }
+      void safePageClose(popupPage, { retainUntilSettled: true });
+      log('warn', 'popup registration failed', { userId: key, error: error.message });
+    } finally {
+      releaseCapacity();
+    }
   });
 }
 
@@ -1875,22 +1955,36 @@ async function camofoxPressureCleanup(options = {}) {
     for (const item of selected) {
       if (!item.group.has(item.tabId)) continue;
       if ((sessionTabCounts.get(item.userId) || 0) <= minTabsPerSession) continue;
-      const lockState = pressureLockState(item.tabId);
-      if (lockState.active || lockState.queued > 0) continue;
-      if (item.tabState.navigateAbort) item.tabState.navigateAbort.abort();
-      await clearTabDownloads(item.tabState).catch(() => {});
-      await safePageClose(item.tabState.page);
-      item.group.delete(item.tabId);
-      sessionTabCounts.set(item.userId, Math.max(0, (sessionTabCounts.get(item.userId) || 0) - 1));
-      const lock = tabLocks.get(item.tabId);
-      if (lock) {
+      const lock = getTabLock(item.tabId);
+      const claim = claimTabForPressureCleanup({
+        sessions,
+        userId: item.userId,
+        session: item.session,
+        group: item.group,
+        tabId: item.tabId,
+        tabState: item.tabState,
+        observedToolCalls: item.toolCalls,
+        lock,
+      });
+      if (!claim) continue;
+      try {
+        if ((sessionTabCounts.get(item.userId) || 0) <= minTabsPerSession) {
+          item.group.set(item.tabId, item.tabState);
+          continue;
+        }
+        if (item.tabState.navigateAbort) item.tabState.navigateAbort.abort();
+        await clearTabDownloads(item.tabState).catch(() => {});
+        await safePageClose(item.tabState.page, { retainUntilSettled: true });
+        sessionTabCounts.set(item.userId, Math.max(0, (sessionTabCounts.get(item.userId) || 0) - 1));
         lock.drain();
         tabLocks.delete(item.tabId);
+        tabsReapedTotal.inc();
+        pluginEvents.emit('tab:reaped', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, reason: 'pressure_cleanup', idleMs: item.idleMs });
+        log('info', 'tab reaped (pressure cleanup)', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, idleMs: item.idleMs, toolCalls: item.toolCalls });
+        closed.push({ session: pressureHash(item.userId), tab: pressureHash(item.tabId), group: pressureHash(item.listItemId), idleMs: item.idleMs, toolCalls: item.toolCalls });
+      } finally {
+        claim.release();
       }
-      tabsReapedTotal.inc();
-      pluginEvents.emit('tab:reaped', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, reason: 'pressure_cleanup', idleMs: item.idleMs });
-      log('info', 'tab reaped (pressure cleanup)', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, idleMs: item.idleMs, toolCalls: item.toolCalls });
-      closed.push({ session: pressureHash(item.userId), tab: pressureHash(item.tabId), group: pressureHash(item.listItemId), idleMs: item.idleMs, toolCalls: item.toolCalls });
     }
 
     for (const [userId, session] of Array.from(sessions.entries())) {
@@ -1952,7 +2046,7 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
   group.set(tabId, tabState);
-  attachPopupHandler(page, userId, sessionKey);
+  attachPopupHandler(page, userId, sessionKey, session);
   refreshActiveTabsGauge();
 
   log('warn', 'replaying google search on fresh context (per-context proxy rotation)', {
@@ -2880,7 +2974,7 @@ async function createTabHandler(req, res) {
               tabState = createTabState(page);
               attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
               group.set(tabId, tabState);
-              attachPopupHandler(page, userId, resolvedSessionKey);
+              attachPopupHandler(page, userId, resolvedSessionKey, session);
               refreshActiveTabsGauge();
             },
             unregister: async () => {
@@ -2911,7 +3005,7 @@ async function createTabHandler(req, res) {
           }
         };
 
-        let session = await getSession(userId, { trace: !!trace });
+        let session = await getSession(userId, { trace: !!trace, signal });
         if (signal.aborted) throw signal.reason;
         try {
           return await createAttempt(session);
@@ -2928,7 +3022,7 @@ async function createTabHandler(req, res) {
             failedSession: session,
             closeSession,
             closeOptions: { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true },
-            getSession: () => getSession(userId, { trace: !!trace }),
+            getSession: () => getSession(userId, { trace: !!trace, signal }),
           });
           return createAttempt(session);
         }
@@ -3100,7 +3194,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
-          attachPopupHandler(page, userId, currentSessionKey);
+          attachPopupHandler(page, userId, currentSessionKey, session);
           refreshActiveTabsGauge();
         };
 
@@ -3262,17 +3356,20 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
 
     // Cached chunk retrieval for offset>0 requests
     if (offset > 0 && tabState.lastSnapshot) {
-      const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
-      if (req.query.includeScreenshot === 'true') {
-        const pngBuffer = await tabState.page.screenshot({ type: 'png' });
-        response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
-      }
-      log('info', 'snapshot (cached offset)', { reqId: req.reqId, tabId: req.params.tabId, offset, totalChars: win.totalChars });
+      const response = await withTabLock(req.params.tabId, async () => {
+        const win = windowSnapshot(tabState.lastSnapshot, offset);
+        const cached = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+        if (req.query.includeScreenshot === 'true') {
+          const pngBuffer = await tabState.page.screenshot({ type: 'png' });
+          cached.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+        }
+        return cached;
+      }, requestTimeoutMs());
+      log('info', 'snapshot (cached offset)', { reqId: req.reqId, tabId: req.params.tabId, offset, totalChars: response.totalChars });
       return res.json(response);
     }
 
-    const result = await withUserLimit(userId, () => withTimeout((async () => {
+    const result = await withUserLimit(userId, () => withTabLock(req.params.tabId, async () => {
       if (proxyPool?.canRotateSessions && isGoogleSearchUrl(tabState.lastRequestedUrl || '')) {
         const blocked = await isGoogleSearchBlocked(tabState.page);
         const unavailable = !blocked && await isGoogleUnavailable(tabState.page);
@@ -3375,7 +3472,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       }
 
       return response;
-    })(), requestTimeoutMs(), 'snapshot'));
+    }, requestTimeoutMs()));
 
     pluginEvents.emit('tab:snapshot', { userId: req.query.userId, tabId: req.params.tabId, snapshot: result.snapshot });
     log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
@@ -3440,7 +3537,10 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
     session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork });
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    const ready = await withTabLock(req.params.tabId, () => (
+      waitForPageReady(tabState.page, { timeout, waitForNetwork })
+    ), requestTimeoutMs(timeout));
     
     res.json({ ok: true, ready });
   } catch (err) {
@@ -4030,8 +4130,10 @@ app.post('/tabs/:tabId/viewport', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
-    await tabState.page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
-    await tabState.page.waitForTimeout(150);
+    await withTabLock(req.params.tabId, async () => {
+      await tabState.page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
+      await tabState.page.waitForTimeout(150);
+    });
 
     pluginEvents.emit('tab:viewport', { userId, tabId: req.params.tabId, width, height });
     res.json({ ok: true, width: Math.round(width), height: Math.round(height) });
@@ -4403,11 +4505,11 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++;
 
-    const downloads = await getDownloadsList(tabState, { includeData, maxBytes });
-
-    if (consume) {
-      await clearTabDownloads(tabState);
-    }
+    const downloads = await withTabLock(req.params.tabId, async () => {
+      const current = await getDownloadsList(tabState, { includeData, maxBytes });
+      if (consume) await clearTabDownloads(tabState);
+      return current;
+    });
 
     res.json({ tabId: req.params.tabId, downloads });
   } catch (err) {
@@ -4479,7 +4581,9 @@ app.get('/tabs/:tabId/images', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++;
 
-    const images = await extractPageImages(tabState.page, { includeData, maxBytes, limit });
+    const images = await withTabLock(req.params.tabId, () => (
+      extractPageImages(tabState.page, { includeData, maxBytes, limit })
+    ));
 
     res.json({ tabId: req.params.tabId, images });
   } catch (err) {
@@ -4540,7 +4644,10 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
     session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    const buffer = await withTabLock(req.params.tabId, () => (
+      tabState.page.screenshot({ type: 'png', fullPage })
+    ));
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', 'image/png');
     res.send(buffer);
@@ -4607,7 +4714,7 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
     session.lastAccess = Date.now();
     
     const { tabState, listItemId } = found;
-    res.json({
+    const stats = await withTabLock(req.params.tabId, async () => ({
       tabId: req.params.tabId,
       sessionKey: listItemId,
       listItemId, // Legacy compatibility
@@ -4616,7 +4723,8 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
       downloadsCount: Array.isArray(tabState.downloads) ? tabState.downloads.length : 0,
       toolCalls: tabState.toolCalls,
       refsCount: tabState.refs.size
-    });
+    }));
+    res.json(stats);
   } catch (err) {
     log('error', 'stats failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -4689,7 +4797,7 @@ app.post('/tabs/:tabId/evaluate', authMiddleware(), express.json({ limit: '1mb' 
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
-    const result = await tabState.page.evaluate(expression);
+    const result = await withTabLock(req.params.tabId, () => tabState.page.evaluate(expression));
     pluginEvents.emit('tab:evaluated', { userId, tabId: req.params.tabId, result });
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
     res.json({ ok: true, result });
@@ -4893,10 +5001,12 @@ app.delete('/tabs/:tabId', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (found) {
-      if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
-      await clearTabDownloads(found.tabState);
-      await safePageClose(found.tabState.page);
-      found.group.delete(req.params.tabId);
+      await withTabLock(req.params.tabId, async () => {
+        if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
+        await clearTabDownloads(found.tabState);
+        await safePageClose(found.tabState.page);
+        found.group.delete(req.params.tabId);
+      });
       { const _l = tabLocks.get(req.params.tabId); if (_l) _l.drain(); tabLocks.delete(req.params.tabId); refreshTabLockQueueDepth(); }
       if (found.group.size === 0) {
         session.tabGroups.delete(found.listItemId);
@@ -5930,6 +6040,8 @@ app.get('/snapshot', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
+    return await withTabLock(targetId, async () => {
+
     // Cached chunk retrieval
     if (offset > 0 && tabState.lastSnapshot) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
@@ -6014,7 +6126,8 @@ app.get('/snapshot', async (req, res) => {
       response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
     }
 
-    res.json(response);
+    return res.json(response);
+    });
   } catch (err) {
     log('error', 'openclaw snapshot failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -6327,6 +6440,16 @@ process.on('unhandledRejection', (reason) => {
 // Graceful shutdown
 let shuttingDown = false;
 
+function closeHttpServer() {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error?.code === 'ERR_SERVER_NOT_RUNNING') resolve();
+      else if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -6339,26 +6462,46 @@ async function gracefulShutdown(signal) {
   }, 30000);
   forceTimeout.unref();
 
-  server.close();
+  const httpClosePromise = closeHttpServer();
+  void httpClosePromise.catch(() => {});
   stopMemoryReporter();
 
-  await settleAllConcurrently(Array.from(sessionCreations.values()), (creation) => (
-    settleWithin(creation, 2000)
-  ));
-
-  await settleWithin(
-    pluginEvents.emitAsyncSettled('server:shutdown', { signal }, (err) => {
-      log('warn', 'server:shutdown plugin failed', { signal, error: err?.message || String(err) });
-    }),
-    2000,
-  );
-
-  await closeAllSessions(`shutdown:${signal}`, {
+  // Teardown is the cancellation mechanism for raw browser work. Closing the
+  // published contexts and browser first lets timed-out requests and invalidated
+  // creations settle instead of deadlocking shutdown while we drain them.
+  const closeSessionsPromise = closeAllSessions(`shutdown:${signal}`, {
     clearDownloads: false,
-    clearLocks: false,
+    clearLocks: true,
+    teardownTimeoutMs: Number.POSITIVE_INFINITY,
+  });
+  // Begin browser closure without waiting for potentially hung teardown hooks.
+  // The raw teardown registry keeps those operations visible to the final drain.
+  const closeBrowserPromise = closeBrowserFully(`shutdown:${signal}`);
+  await Promise.allSettled([closeSessionsPromise, closeBrowserPromise]);
+
+  // server.close() waits for admitted handlers. Await it before the final
+  // operation drains so no handler can register work after a drain snapshot.
+  await httpClosePromise;
+  await Promise.allSettled(Array.from(sessionCreations.values()));
+  await activeTimedOperations.drain();
+  await activeSessionTeardownOperations.drain();
+
+  // Defensive final sweep after all admitted handlers have left. The
+  // shutdown guard in ensureBrowser prevents this sweep racing a relaunch.
+  await closeAllSessions(`shutdown:${signal}:final_sweep`, {
+    clearDownloads: false,
+    clearLocks: true,
+    teardownTimeoutMs: Number.POSITIVE_INFINITY,
+  });
+  await closeBrowserFully(`shutdown:${signal}:final_sweep`);
+  await Promise.allSettled(Array.from(sessionCreations.values()));
+  await activeTimedOperations.drain();
+  await activeSessionTeardownOperations.drain();
+
+  await pluginEvents.emitAsyncSettled('server:shutdown', { signal }, (err) => {
+    log('warn', 'server:shutdown plugin failed', { signal, error: err?.message || String(err) });
   });
 
-  await closeBrowserFully(`shutdown:${signal}`);
   await sentryFlush(2000);
   process.exit(0);
 }
