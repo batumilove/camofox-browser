@@ -2091,21 +2091,33 @@ function attachPopupHandler(page, userId, sessionKey) {
       return;
     }
 
-    try {
-      const popupTabId = fly.makeTabId();
+    const popupTabId = fly.makeTabId();
       const popupTabState = createTabState(popupPage);
       attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
-      const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
+      const popupGroupKey = sessionKey || '__popups__';
+      const popupGroup = getTabGroup(currentSession, popupGroupKey);
       popupGroup.set(popupTabId, popupTabState);
-      currentSession.lastAccess = Date.now();
-      refreshActiveTabsGauge();
-      log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
-      pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
-      // Recursively handle popups from the popup
-      attachPopupHandler(popupPage, userId, sessionKey);
-    } finally {
-      releaseReservation();
-    }
+      try {
+        currentSession.lastAccess = Date.now();
+        refreshActiveTabsGauge();
+        log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
+        pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
+        // Recursively handle popups from the popup
+        attachPopupHandler(popupPage, userId, sessionKey);
+      } catch (error) {
+        // A synchronous registration failure (e.g. a tab:created listener
+        // throwing) must not leave a phantom tab in the group: roll back the
+        // exact published state before closing the popup page.
+        popupGroup.delete(popupTabId);
+        if (popupGroup.size === 0) {
+          currentSession.tabGroups.delete(popupGroupKey);
+        }
+        refreshActiveTabsGauge();
+        log('warn', 'popup registration failed; rolled back tab state', { userId: key, tabId: popupTabId, error: error?.message });
+        safePageClose(popupPage).catch(() => {});
+      } finally {
+        releaseReservation();
+      }
   });
 }
 
