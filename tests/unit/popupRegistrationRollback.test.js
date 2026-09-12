@@ -48,4 +48,30 @@ describe('popup registration rollback', () => {
     expect(closeMatch).not.toBeNull();
     expect(closeMatch[0]).toMatch(/\.catch\(\(\) => \{\}\)|\.catch\(\(\) =>\s*\{\}\)/);
   });
+
+  test('every operation after reservation acquisition is covered by the releaseReservation finally', () => {
+    // From a successful reserveTab() to the end of the handler, a throw in
+    // any synchronous step (makeTabId, createTabState, getTabGroup, set)
+    // must still run releaseReservation() exactly once.
+    const reserveIndex = popupHandler.indexOf('capacityReservations.reserveTab(');
+    expect(reserveIndex).toBeGreaterThan(-1);
+    const rejectIndex = popupHandler.indexOf('if (!releaseReservation)');
+    expect(rejectIndex).toBeGreaterThan(reserveIndex);
+    const afterReject = popupHandler.slice(rejectIndex);
+    const outerTryIndex = afterReject.indexOf('try {');
+    expect(outerTryIndex).toBeGreaterThan(-1);
+    // the outer try must begin before any registration work
+    const makeTabIdIndex = afterReject.indexOf('fly.makeTabId()');
+    expect(makeTabIdIndex).toBeGreaterThan(outerTryIndex);
+    // and the final finally of the handler must release the reservation
+    const finallys = [...afterReject.matchAll(/finally \{/g)].map((m) => m.index);
+    expect(finallys.length).toBeGreaterThan(0);
+    const lastFinally = afterReject.slice(finallys[finallys.length - 1]);
+    expect(lastFinally).toMatch(/releaseReservation\(\)/);
+    // no code path exits the handler between the rejection block and the outer try
+    const rejectBlockEnd = afterReject.search(/\n    }\n/);
+    expect(rejectBlockEnd).toBeGreaterThan(-1);
+    const between = afterReject.slice(rejectBlockEnd, outerTryIndex);
+    expect(between).not.toMatch(/return/);
+  });
 });

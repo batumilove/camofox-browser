@@ -2091,7 +2091,8 @@ function attachPopupHandler(page, userId, sessionKey) {
       return;
     }
 
-    const popupTabId = fly.makeTabId();
+    try {
+      const popupTabId = fly.makeTabId();
       const popupTabState = createTabState(popupPage);
       attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
       const popupGroupKey = sessionKey || '__popups__';
@@ -2115,9 +2116,10 @@ function attachPopupHandler(page, userId, sessionKey) {
         refreshActiveTabsGauge();
         log('warn', 'popup registration failed; rolled back tab state', { userId: key, tabId: popupTabId, error: error?.message });
         safePageClose(popupPage).catch(() => {});
-      } finally {
-        releaseReservation();
       }
+    } finally {
+      releaseReservation();
+    }
   });
 }
 
