@@ -6674,6 +6674,7 @@ app.post('/tabs/open', async (req, res) => {
       // is published after successful navigation or cleaned up on any error.
       let pageLease = null;
       let leaseSession = null;
+      let retryReservation = null;
       const tabId = fly.makeTabId();
       const publishTab = (p, lease, state) => {
         group.set(tabId, state);
@@ -6702,17 +6703,30 @@ app.post('/tabs/open', async (req, res) => {
             browserRestartsTotal.labels('proxy_retry').inc();
             const key = normalizeUserId(userId);
             const oldSession = sessions.get(key);
-            // The unpublished page and its lease die with the rotated session.
+            // The unpublished page and its lease die with the rotated session;
+            // release the original reservation before rotating so a fresh
+            // reservation against the replacement session is not rejected.
+            if (releaseTabReservation) releaseTabReservation();
+            releaseTabReservation = null;
+            if (oldSession) {
+              try {
+                await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
+              } catch (closeErr) {
+                // closeSession can reject while leaving a live context: fall
+                // back to closing the unpublished leased page directly.
+                await closeLeasedPage(session, page, pageLease).catch(() => {});
+                pageLease = null;
+                leaseSession = null;
+                throw closeErr;
+              }
+            }
             pageLease = null;
             leaseSession = null;
-            if (oldSession) {
-              await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-            }
             assertAdmissionCurrent();
             session = await getSession(userId);
             assertAdmissionCurrent();
             group = getTabGroup(session, listItemId);
-            const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
+            retryReservation = await reserveTabCreation(userId, session, req.reqId);
             try {
               const retryCreated = await createLeasedPage(session);
               page = retryCreated.page;
@@ -6724,9 +6738,9 @@ app.post('/tabs/open', async (req, res) => {
               await withPageLoadDuration('open_url', () => navigatePage(page, url));
               assertAdmissionCurrent();
               recordNavSuccess(userId);
-              publishTab(page, retryCreated.lease, tabState);
             } finally {
-              releaseRetryReservation();
+              if (retryReservation) retryReservation();
+              retryReservation = null;
             }
           } else {
             if (recordNavFailure(userId)) {
@@ -6736,7 +6750,7 @@ app.post('/tabs/open', async (req, res) => {
           }
         }
         assertAdmissionCurrent();
-        publishTab(page, created.lease, tabState);
+        publishTab(page, pageLease, tabState);
       } catch (err) {
         if (pageLease && leaseSession) {
           const lease = pageLease;
@@ -6747,7 +6761,8 @@ app.post('/tabs/open', async (req, res) => {
         }
         throw err;
       } finally {
-        releaseTabReservation();
+        if (releaseTabReservation) releaseTabReservation();
+        if (retryReservation) retryReservation();
       }
     tabState.visitedUrls.add(url);
     
