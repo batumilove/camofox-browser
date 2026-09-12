@@ -6675,6 +6675,8 @@ app.post('/tabs/open', async (req, res) => {
       let pageLease = null;
       let leaseSession = null;
       let retryReservation = null;
+      let finalUrl = '';
+      let finalTitle = '';
       const tabId = fly.makeTabId();
       const publishTab = (p, lease, state) => {
         group.set(tabId, state);
@@ -6756,8 +6758,8 @@ app.post('/tabs/open', async (req, res) => {
         // Compute all response data BEFORE publishing so nothing fallible is
         // awaited after the publication point (an admission timeout during a
         // post-publish await would return an error while leaving a live tab).
-        const responseUrl = page.url();
-        const responseTitle = await page.title().catch(() => '');
+        finalUrl = page.url();
+        finalTitle = await page.title().catch(() => '');
         assertAdmissionCurrent();
         publishTab(page, pageLease, tabState);
       } catch (err) {
@@ -6780,8 +6782,8 @@ app.post('/tabs/open', async (req, res) => {
         ok: true,
         targetId: tabId,
         tabId,
-        url: responseUrl,
-        title: responseTitle,
+        url: finalUrl,
+        title: finalTitle,
       };
     });
     res.json(result);
