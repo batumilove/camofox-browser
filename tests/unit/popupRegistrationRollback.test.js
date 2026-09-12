@@ -104,6 +104,10 @@ describe('popup registration rollback', () => {
     const finallyBody = popupHandler.slice(outerFinally[0], outerFinally[1]);
     const releases = [...finallyBody.matchAll(/releaseReservation\(\)/g)];
     expect(releases.length).toBe(1);
+    // exactly one release in the ENTIRE post-rejection handler region
+    const postReject = popupHandler.slice(rejectIdx + 'if (!releaseReservation)'.length);
+    const allReleases = [...postReject.matchAll(/releaseReservation\(\)/g)];
+    expect(allReleases.length).toBe(1);
 
     // Inner catch guards the post-publication body.
     const innerTry = blockRange(popupHandler, 'try', setRange[1]);
@@ -111,7 +115,9 @@ describe('popup registration rollback', () => {
     expect(innerTry[0]).toBeGreaterThan(setRange[0]);
     const innerCatch = blockRange(popupHandler, /catch \(error\) \{/g, innerTry[1] - 40);
     expect(innerCatch).not.toBeNull();
-    expect(innerCatch[0]).toBeGreaterThanOrEqual(innerTry[1] - 1);
+    // the inner catch keyword is the ONLY text between inner try end and catch start
+    const intervening = popupHandler.slice(innerTry[1], innerCatch[0]);
+    expect(intervening.trim()).toBe('');
     const catchBody = popupHandler.slice(innerCatch[0], innerCatch[1]);
 
     // Rollback completeness and ordering: delete tab, delete empty group,
@@ -139,6 +145,13 @@ describe('popup registration rollback', () => {
     expect(closeMatch[0]).toMatch(/\.catch\(\(\) => \{\}\)/);
     // catch body must not rethrow
     expect(catchBody).not.toMatch(/throw\b/);
+    // no control-flow exit before the rollback statements: the text from the
+    // catch open brace to popupGroup.delete contains no return/throw
+    const preRollback = catchBody.slice(0, delIdx);
+    expect(preRollback).not.toMatch(/\b(return|throw)\b/);
+    // and no unconditional exit between delete and the page close either
+    const rollbackSpan = catchBody.slice(delIdx, closeIdx);
+    expect(rollbackSpan).not.toMatch(/\b(return|throw)\b/);
   });
 
   test('every operation after reservation acquisition is covered by the releaseReservation finally', () => {
