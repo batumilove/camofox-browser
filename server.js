@@ -6670,72 +6670,85 @@ app.post('/tabs/open', async (req, res) => {
       let group = getTabGroup(session, listItemId);
       let page;
       let tabState;
+      // Active unpublished lease (and its owning session), held until the tab
+      // is published after successful navigation or cleaned up on any error.
+      let pageLease = null;
+      let leaseSession = null;
       const tabId = fly.makeTabId();
+      const publishTab = (p, lease, state) => {
+        group.set(tabId, state);
+        releasePageLease(session, lease);
+        pageLease = null;
+        leaseSession = null;
+        attachPopupHandler(p, userId, listItemId);
+        refreshActiveTabsGauge();
+      };
       try {
         const created = await createLeasedPage(session);
         page = created.page;
-        try {
-          assertAdmissionCurrent();
-        } catch (assertErr) {
-          await closeLeasedPage(session, created.page, created.lease);
-          throw assertErr;
-        }
+        pageLease = created.lease;
+        leaseSession = session;
+        assertAdmissionCurrent();
         tabState = createTabState(page);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-        group.set(tabId, tabState);
-        releasePageLease(session, created.lease);
+        try {
+          await withPageLoadDuration('open_url', () => navigatePage(page, url));
+          recordNavSuccess(userId);
+        } catch (navErr) {
+          if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
+            log('warn', 'tab open failed, retrying with fresh proxy', {
+              reqId: req.reqId, tabId, error: navErr.message,
+            });
+            browserRestartsTotal.labels('proxy_retry').inc();
+            const key = normalizeUserId(userId);
+            const oldSession = sessions.get(key);
+            // The unpublished page and its lease die with the rotated session.
+            pageLease = null;
+            leaseSession = null;
+            if (oldSession) {
+              await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
+            }
+            assertAdmissionCurrent();
+            session = await getSession(userId);
+            assertAdmissionCurrent();
+            group = getTabGroup(session, listItemId);
+            const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
+            try {
+              const retryCreated = await createLeasedPage(session);
+              page = retryCreated.page;
+              pageLease = retryCreated.lease;
+              leaseSession = session;
+              assertAdmissionCurrent();
+              tabState = createTabState(page);
+              attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+              await withPageLoadDuration('open_url', () => navigatePage(page, url));
+              assertAdmissionCurrent();
+              recordNavSuccess(userId);
+              publishTab(page, retryCreated.lease, tabState);
+            } finally {
+              releaseRetryReservation();
+            }
+          } else {
+            if (recordNavFailure(userId)) {
+              await recoverUserSession(userId, 'tab_open_nav_failure');
+            }
+            throw navErr;
+          }
+        }
+        assertAdmissionCurrent();
+        publishTab(page, created.lease, tabState);
+      } catch (err) {
+        if (pageLease && leaseSession) {
+          const lease = pageLease;
+          const owningSession = leaseSession;
+          pageLease = null;
+          leaseSession = null;
+          await closeLeasedPage(owningSession, page, lease).catch(() => {});
+        }
+        throw err;
       } finally {
         releaseTabReservation();
       }
-    attachPopupHandler(page, userId, listItemId);
-    refreshActiveTabsGauge();
-
-    try {
-      await withPageLoadDuration('open_url', () => navigatePage(page, url));
-      recordNavSuccess(userId);
-    } catch (navErr) {
-      if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
-        log('warn', 'tab open failed, retrying with fresh proxy', {
-          reqId: req.reqId, tabId, error: navErr.message,
-        });
-        browserRestartsTotal.labels('proxy_retry').inc();
-        const key = normalizeUserId(userId);
-        const oldSession = sessions.get(key);
-        if (oldSession) {
-          await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
-        }
-        assertAdmissionCurrent();
-        session = await getSession(userId);
-        assertAdmissionCurrent();
-        group = getTabGroup(session, listItemId);
-        const releaseRetryReservation = await reserveTabCreation(userId, session, req.reqId);
-        try {
-          const retryCreated = await createLeasedPage(session);
-          page = retryCreated.page;
-          try {
-            assertAdmissionCurrent();
-          } catch (assertErr) {
-            await closeLeasedPage(session, retryCreated.page, retryCreated.lease);
-            throw assertErr;
-          }
-          tabState = createTabState(page);
-          attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-          group.set(tabId, tabState);
-          releasePageLease(session, retryCreated.lease);
-        } finally {
-          releaseRetryReservation();
-        }
-        attachPopupHandler(page, userId, listItemId);
-        refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => navigatePage(page, url));
-        recordNavSuccess(userId);
-      } else {
-        if (recordNavFailure(userId)) {
-          await recoverUserSession(userId, 'tab_open_nav_failure');
-        }
-        throw navErr;
-      }
-    }
     tabState.visitedUrls.add(url);
     
     log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
