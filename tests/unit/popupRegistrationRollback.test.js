@@ -104,6 +104,9 @@ describe('popup registration rollback', () => {
     const finallyBody = popupHandler.slice(outerFinally[0], outerFinally[1]);
     const releases = [...finallyBody.matchAll(/releaseReservation\(\)/g)];
     expect(releases.length).toBe(1);
+    // the release is unconditional: the finally body is only the call itself
+    expect(finallyBody.replace(/\s/g, '')).toBe('finally{releaseReservation();}');
+    expect(finallyBody).not.toMatch(/\b(if|throw|return)\b/);
     // exactly one release in the ENTIRE post-rejection handler region, by
     // any invocation form (direct, .call, .apply, aliasing is excluded by
     // requiring the identifier to appear exactly twice: declaration + call)
@@ -130,7 +133,12 @@ describe('popup registration rollback', () => {
     // delete tab, delete empty group, refresh gauge — all before page close,
     // strictly ordered, and not nested inside any if/conditional.
     const delIdx = catchBody.indexOf('popupGroup.delete(popupTabId)');
-    const emptyGroupIdx = catchBody.search(/popupGroup\.size === 0[\s\S]*?tabGroups\.delete\(popupGroupKey\)/);
+    // anchor the empty-group step on the actual delete position, not the guard
+    const emptyGroupIdx = catchBody.indexOf('tabGroups.delete(popupGroupKey)');
+    // the delete must sit INSIDE the empty-group guard's block
+    const guardMatch = catchBody.match(/if \(popupGroup\.size === 0\) \{([\s\S]*?)\n\s*}/);
+    expect(guardMatch).not.toBeNull();
+    expect(guardMatch[1]).toContain('tabGroups.delete(popupGroupKey)');
     const gaugeIdx = catchBody.indexOf('refreshActiveTabsGauge()');
     const closeIdx = catchBody.indexOf('safePageClose(popupPage');
     expect(delIdx).toBeGreaterThan(-1);
