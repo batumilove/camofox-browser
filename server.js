@@ -6666,7 +6666,7 @@ app.post('/tabs/open', async (req, res) => {
       };
       let session = await getSession(userId);
       assertAdmissionCurrent();
-      const releaseTabReservation = await reserveTabCreation(userId, session, req.reqId);
+      let releaseTabReservation = await reserveTabCreation(userId, session, req.reqId);
       let group = getTabGroup(session, listItemId);
       let page;
       let tabState;
@@ -6702,7 +6702,10 @@ app.post('/tabs/open', async (req, res) => {
             });
             browserRestartsTotal.labels('proxy_retry').inc();
             const key = normalizeUserId(userId);
-            const oldSession = sessions.get(key);
+            // Rotate only the session that owns this request's failed leased
+            // page. A newer map entry (another request's replacement session)
+            // must never be closed here.
+            const oldSession = sessions.get(key) === session ? session : null;
             // The unpublished page and its lease die with the rotated session;
             // release the original reservation before rotating so a fresh
             // reservation against the replacement session is not rejected.
@@ -6750,6 +6753,12 @@ app.post('/tabs/open', async (req, res) => {
           }
         }
         assertAdmissionCurrent();
+        // Compute all response data BEFORE publishing so nothing fallible is
+        // awaited after the publication point (an admission timeout during a
+        // post-publish await would return an error while leaving a live tab).
+        const responseUrl = page.url();
+        const responseTitle = await page.title().catch(() => '');
+        assertAdmissionCurrent();
         publishTab(page, pageLease, tabState);
       } catch (err) {
         if (pageLease && leaseSession) {
@@ -6771,8 +6780,8 @@ app.post('/tabs/open', async (req, res) => {
         ok: true,
         targetId: tabId,
         tabId,
-        url: page.url(),
-        title: await page.title().catch(() => ''),
+        url: responseUrl,
+        title: responseTitle,
       };
     });
     res.json(result);
